@@ -224,7 +224,8 @@ def run_plans(commits, verifier, ms, cpu, verify_until):
             c.why += f" | verify error {e!r}"
             continue
         if c.skip_heavy:
-            ok = passed >= set(c.plan) and probes is not None and probes[0] > 0 and probes[1] == 0
+            ok = (passed >= set(c.plan) and probes is not None
+                  and probes[0] >= policy.SKIP_MIN_RUNS and probes[1] == 0)
             c.why += f" | probes {probes}"
             if ok:
                 dropped = {t for t in c.sel if ms[t] >= policy.HEAVY_MS}

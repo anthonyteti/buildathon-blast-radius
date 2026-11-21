@@ -79,6 +79,12 @@ class Verifier:
         With probe=True, patched modules carry infection probes (app/probe.py).
         Returns (passed numbers, first non-passing number or None,
         (probe executions, infected executions) or None)."""
+        # keep each class's tests together: unittest re-runs setUpClass (1.5 s
+        # for the executor tests) every time the class changes
+        first = {}
+        for i, n in enumerate(nums):
+            first.setdefault(self.class_of(n), i)
+        nums = sorted(nums, key=lambda n: (first[self.class_of(n)], nums.index(n)))
         if self.needs_heavy(nums):
             os.environ.setdefault("OMP_NUM_THREADS", "1")
             os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -379,6 +385,8 @@ def _child(patched, plan, wfd, probe=False):
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_PROF, 0)
             super().stopTest(test)
+            if probe and recorder.infected + recorder.unprobed:
+                self.shouldStop = True  # the expensive-test rule can no longer apply
             if test.id() in by_id:
                 n, _ = by_id[test.id()]
                 out.write(json.dumps([n, not self._bad]) + "\n")

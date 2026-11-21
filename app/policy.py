@@ -59,6 +59,10 @@ def plan(cands, ms, cpu, verifiable, p_none, setup_ms):
 SKIP_HEAVY = os.environ.get("BR_SKIP_HEAVY", "0") == "1"
 # Tests at least this long are "expensive".
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "3000"))
+# CPU ms of cheaper candidates run (with probes) as evidence for the rule.
+SKIP_BUDGET_MS = int(os.environ.get("BR_SKIP_BUDGET_MS", "3000"))
+# Probe executions required before the rule may fire.
+SKIP_MIN_RUNS = int(os.environ.get("BR_SKIP_MIN_RUNS", "20"))
 
 
 def plan_skip(cands, ms, cpu, verifiable, p_none, setup_ms):
@@ -70,9 +74,15 @@ def plan_skip(cands, ms, cpu, verifiable, p_none, setup_ms):
     heavy = {t for t in cands if ms[t] >= HEAVY_MS}
     if not heavy:
         return 0.0, []
-    # cheaper candidates that are also cheap to run here; the rest stay selected
-    v = sorted((t for t in cands if t in verifiable and t not in heavy and cpu[t] <= MAX_VERIFY_MS),
-               key=lambda t: (cpu[t], t))
+    # cheaper candidates, cheapest first, within a CPU budget; the rest stay selected
+    pool = sorted((t for t in cands if t in verifiable and t not in heavy and cpu[t] <= MAX_VERIFY_MS),
+                  key=lambda t: (cpu[t], t))
+    v, spent = [], 0
+    for t in pool:
+        if spent + cpu[t] > SKIP_BUDGET_MS and v:
+            break
+        v.append(t)
+        spent += cpu[t]
     if not v:
         return 0.0, []
     vs = set(v)
