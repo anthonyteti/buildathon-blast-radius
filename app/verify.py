@@ -44,10 +44,13 @@ class Verifier:
         if getattr(self, "_baseline", None) is None:
             a = self.import_state({})
             unstable = set()
+            self.eager = None  # unknown: treat every module as eager
             path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps", "baseline_state.json")
             try:
                 with open(path) as fh:
-                    unstable = set(json.load(fh)["unstable"])
+                    b = json.load(fh)
+                unstable = set(b["unstable"])
+                self.eager = set(b["eager"])
             except (OSError, ValueError, KeyError):
                 pass
             self._baseline = a + [unstable] if a[0] == "ok" else a

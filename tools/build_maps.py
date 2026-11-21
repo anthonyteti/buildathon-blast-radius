@@ -122,8 +122,11 @@ if lazy_dir:
         if f not in _fn_lines:
             _fn_lines[f] = function_lines(f)
         for ln in numbits_to_nums(bits):
-            if ln not in _fn_lines[f]:
-                continue  # import-time code: charged to whichever test loaded the module first
+            if ln not in _fn_lines[f] or ln in preimport.get(f, ()):
+                # import-time code (module bodies, or functions the first run saw
+                # running during import): charged to whichever test loaded the
+                # module first. Its effects are found by the import check.
+                continue
             if not s <= line_tests[f][ln]:
                 lazy_added += 1
                 line_tests[f][ln] |= s

@@ -120,8 +120,9 @@ def import_checks(commits, analyzer, verifier, start):
             continue
         changed = [p for p in state.diff(base[2], st[2], modules=set(st[1])) if p not in unstable]
         fp_tests = analyzer.state_tests(changed)
-        if changed:
-            # tests that import sqlglot in a fresh subprocess see all of it
+        eager = verifier.eager
+        if any(eager is None or p.split(":", 1)[0] in eager for p in changed):
+            # tests that run `import sqlglot` in a fresh subprocess see what it loads
             fp_tests |= analyzer.maps.subprocess_tests
         before = len(c.sel)
         c.sel = c.info["runtime"] | fp_tests

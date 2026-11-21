@@ -165,8 +165,9 @@ def diff(a, b, modules=None):
 
 
 def build_baseline(out_path, runs=3):
-    """Run at image build time: the unpatched fingerprint, plus the paths whose
-    digest varies between processes (address-ordered data), which are ignored."""
+    """Run at image build time: the paths whose digest varies between processes
+    (address-ordered data), which are ignored, and the modules a plain
+    `import sqlglot` loads."""
     import json
     import subprocess
 
@@ -180,8 +181,11 @@ def build_baseline(out_path, runs=3):
     unstable = set()
     for _, other in results[1:]:
         unstable |= set(diff(fp, other))
+    eager = json.loads(subprocess.run(
+        [sys.executable, "-c", "import json, sys, sqlglot; print(json.dumps(sorted(m for m in sys.modules if m.startswith('sqlglot'))))"],
+        capture_output=True, text=True, check=True).stdout)
     with open(out_path, "w") as fh:
-        json.dump({"attributes": len(fp), "unstable": sorted(unstable)}, fh)
+        json.dump({"attributes": len(fp), "unstable": sorted(unstable), "eager": eager}, fh)
     print(f"baseline: {len(fp)} attributes, {len(unstable)} unstable", file=sys.stderr)
 
 
