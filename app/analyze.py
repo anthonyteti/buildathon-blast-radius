@@ -40,6 +40,7 @@ class Analyzer:
         self._importers = None
         self._trees = {}
         self._ref_cache = {}
+        self._ident_index = None
         self._preimport_sets = {}
         self.import_time = False  # set when the last analyze() touched import-time code
 
@@ -134,10 +135,8 @@ class Analyzer:
                 t = set(self.maps.by_file.get(path, set())) | self.importer_tests(path)
                 return t, f"syntax-error->{len(t)}"
             return ALL, "syntax-error"
-        if ast.dump(t0) == ast.dump(t1):
-            return set(), "same-ast"
-        if self.docstring_only(t0, t1):
-            return set(), "docstring"
+        if _dump_without_docstrings(t0) == _dump_without_docstrings(t1):
+            return set(), "same-ast"  # comments, formatting or docstrings only
         ctx = FileCtx(path, old, t0)
         nctx = FileCtx(path, new, t1)
         tests = set()
@@ -160,21 +159,6 @@ class Analyzer:
                         why.append(f"+{nl}:{w}->{len(t)}")
                         break
         return tests, " ".join(why) or "no-code-lines"
-
-    def docstring_only(self, t0, t1):
-        def strip(tree):
-            tree = ast.parse(ast.unparse(tree))
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                    b = node.body
-                    if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
-                        b[0].value.value = ""
-            return ast.dump(tree)
-
-        try:
-            return strip(t0) == strip(t1)
-        except Exception:
-            return False
 
     def line(self, ctx, line):
         """Tests that can notice a change on old line `line`."""
@@ -321,16 +305,25 @@ class Analyzer:
         return self._refcount[name]
 
     def referring(self, refs):
-        pat = re.compile(r"\b(?:" + "|".join(re.escape(r) for r in sorted(refs)) + r")\b")
+        """Tests that executed a covered line naming any of refs (identifier match)."""
+        if self._ident_index is None:
+            self._ident_index = {}
+            ident = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+            for f, lm in self.maps.lines.items():
+                text = self.text(f)
+                if not text:
+                    continue
+                for ln, idx in lm.items():
+                    i = int(ln) - 1
+                    if i < len(text):
+                        for name in set(ident.findall(text[i])):
+                            self._ident_index.setdefault(name, set()).add(idx)
+        idxs = set()
+        for r in refs:
+            idxs |= self._ident_index.get(r, set())
         out = set()
-        for f, lm in self.maps.lines.items():
-            text = self.text(f)
-            if not text:
-                continue
-            for ln, idx in lm.items():
-                i = int(ln) - 1
-                if i < len(text) and pat.search(text[i]):
-                    out |= self.maps.set(idx)
+        for idx in idxs:
+            out |= self.maps.set(idx)
         return out
 
     def family(self, path):
@@ -530,6 +523,38 @@ class FileCtx:
                 if best is None or node.lineno > best.lineno:
                     best = node
         return best
+
+
+def _dump_without_docstrings(tree):
+    """ast.dump without what cannot change behaviour here (in place: callers
+    only need positions afterwards):
+    - docstrings: no test runs doctests (tests/test_docs.py uses unittest's
+      load_tests, which pytest does not collect);
+    - annotations of local variables, which Python never evaluates;
+    - argument/return annotations of undecorated functions in modules with
+      `from __future__ import annotations` (kept as strings, never evaluated;
+      decorated functions keep theirs, e.g. for singledispatch)."""
+    lazy = any(
+        isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations" for a in n.names)
+        for n in tree.body
+    )
+    plain = {"staticmethod", "classmethod", "property"}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            b = node.body
+            if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
+                b[0].value.value = ""
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for sub in ast.walk(node):
+                if sub is not node and isinstance(sub, ast.AnnAssign) and sub.simple:
+                    sub.annotation = ast.Constant("")
+            if lazy and all(isinstance(d, ast.Name) and d.id in plain for d in node.decorator_list):
+                a = node.args
+                for arg in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg]:
+                    if arg is not None:
+                        arg.annotation = None
+                node.returns = None
+    return ast.dump(tree)
 
 
 def _code_lines(source):

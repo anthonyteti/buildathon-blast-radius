@@ -107,7 +107,8 @@ def import_checks(commits, analyzer, verifier, start):
             continue
         if c.patched is None:
             continue  # added/removed/renamed files: the static answer stands
-        st = verifier.import_state(c.patched)
+        mods = affected_modules(c.patched, analyzer)
+        st = verifier.import_state(c.patched, only=mods)
         if st[0] != "ok":
             c.sel = ALL
             c.why += f" | patched import failed: {st[1]}"
@@ -117,7 +118,7 @@ def import_checks(commits, analyzer, verifier, start):
             c.sel = ALL
             c.why += f" | patched import breaks {broken[:3]}"
             continue
-        changed = [p for p in state.diff(base[2], st[2]) if p not in unstable]
+        changed = [p for p in state.diff(base[2], st[2], modules=set(st[1])) if p not in unstable]
         fp_tests = analyzer.state_tests(changed)
         if changed:
             # tests that import sqlglot in a fresh subprocess see all of it
@@ -128,8 +129,13 @@ def import_checks(commits, analyzer, verifier, start):
 
 
 def affected_modules(patched, analyzer):
-    """Patched sqlglot modules and every sqlglot module importing them."""
-    rev = analyzer.importers()
+    """Patched sqlglot modules and every sqlglot module whose import runs
+    theirs (module-level imports only). Their import-time state is what the
+    patch can change; it is compared against a full unpatched import."""
+    rev = {}
+    for f, deps in analyzer.maps.imports_top.items():
+        for d in deps:
+            rev.setdefault(d, set()).add(f)
     seen = set()
     todo = [p for p in patched if p.startswith("sqlglot/") and p.endswith(".py")]
     while todo:

@@ -17,6 +17,7 @@ class Maps:
         self.lists = m["lists"]
         self.preimport = m["preimport"]
         self.imports = m.get("imports", {})
+        self.imports_top = m.get("imports_top", self.imports)
         self.uses = m.get("uses", {})
         # measured in-process CPU (tools/measure_cpu.py), scaled to tests.json's machine
         self.class_setup = {}

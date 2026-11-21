@@ -18,6 +18,9 @@ commit. Layout:
              or collected count for every test in that file.
   preimport  {file: [lines]} executed only while importing sqlglot (module and
              class bodies); the selector handles those by name references.
+  imports    {file: files it imports anywhere}; imports_top: only imports that
+             run while the module is imported (no function bodies, no
+             `if TYPE_CHECKING:` blocks)
   opens      {path: set index} tests that open()ed the file
   lists      {dir: set index}  tests that listed the directory
   subprocess [set index]  tests that start subprocesses
@@ -195,8 +198,9 @@ def module_file(mod):
 
 
 imports = {}
-for top in ("sqlglot", "tests"):
-    for root, _, names in os.walk(os.path.join(src, top)):
+imports_top = {}
+for top_dir in ("sqlglot", "tests"):
+    for root, _, names in os.walk(os.path.join(src, top_dir)):
         for name in names:
             if not name.endswith(".py"):
                 continue
@@ -208,6 +212,26 @@ for top in ("sqlglot", "tests"):
             except SyntaxError:
                 continue
             deps = set()
+            top = set()
+            # imports executed while the module is imported: module and class
+            # bodies, not function bodies, not `if TYPE_CHECKING:` blocks
+            runs_at_import = set()
+
+            def mark(body):
+                for st in body:
+                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    if isinstance(st, ast.If) and "TYPE_CHECKING" in ast.unparse(st.test):
+                        mark(st.orelse)
+                        continue
+                    runs_at_import.add(id(st))
+                    for field in ("body", "orelse", "handlers", "finalbody"):
+                        sub = getattr(st, field, None)
+                        if isinstance(sub, list):
+                            mark([x for x in sub if isinstance(x, ast.stmt)] if field != "handlers" else
+                                 [y for h in sub for y in h.body])
+
+            mark(tree.body)
             for node in ast.walk(tree):
                 mods = []
                 if isinstance(node, ast.Import):
@@ -224,8 +248,12 @@ for top in ("sqlglot", "tests"):
                         f = module_file(".".join(parts[:k]))
                         if f and f != path:
                             deps.add(f)
+                            if id(node) in runs_at_import:
+                                top.add(f)
             imports[path] = sorted(deps)
+            imports_top[path] = sorted(top)
 out["imports"] = imports
+out["imports_top"] = imports_top
 os.makedirs(maps_dir, exist_ok=True)
 data = json.dumps(out, separators=(",", ":")).encode()
 with open(os.path.join(maps_dir, "coverage.json.gz"), "wb") as fh:
