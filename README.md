@@ -62,10 +62,16 @@ whose import runs them are imported and compared:
 
 - a module that imported before now fails to import: every test;
 - no attribute changed: nothing beyond the coverage of the changed lines;
+- a dict table (`TRANSFORMS`, `FUNCTIONS`, ...) whose changed keys all name
+  expression classes (the key itself, or the class a parser entry builds):
+  tests that created those expressions, within the dialect's tests. The
+  per-key digests are compared only for tables whose digest changed;
 - otherwise: tests that created an expression of a class whose attribute
   changed, plus tests running code that names a changed attribute. In a
-  dialect's modules those are limited to tests that use the dialect; elsewhere
-  an attribute name read almost everywhere is replaced by its class's name.
+  dialect's modules those are limited to tests that use the dialect (all of
+  them for `TRANSFORMS`, which the generator reads once into a cached dispatch
+  table); elsewhere an attribute name read almost everywhere is replaced by
+  its class's name.
   Tests that import sqlglot in a subprocess are added when an eagerly
   imported module changed.
 

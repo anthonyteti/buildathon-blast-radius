@@ -42,15 +42,14 @@ class Maps:
         self.slot_number = [number.get(t) for t in m["tests"]]
         self.mapped = {n for n in self.slot_number if n is not None}
         # tests whose outcome an in-process run cannot reproduce: they start
-        # subprocesses (which would see the unpatched tree) or read sources as text
+        # subprocesses, which would see the unpatched tree. (Tests reading
+        # sources as text are fine: the coverage run saw those reads go through
+        # open(), which the verification child serves from the patch.)
         self.unverifiable = set()
         self.subprocess_tests = set()
         for idx in m.get("subprocess", []):
             self.subprocess_tests |= self.set(idx)
         self.unverifiable |= self.subprocess_tests
-        for p, idx in self.opens.items():
-            if p.endswith(".py"):
-                self.unverifiable |= self.set(idx)
         for t in self.tests:
             # never assume a test is cheaper to run here than recorded
             self.cpu_ms[t["number"]] = max(self.ms[t["number"]], self._cpu_by_id.get(t["id"], 0))

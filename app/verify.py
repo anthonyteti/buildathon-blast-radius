@@ -48,10 +48,11 @@ class Verifier:
                 with open(path) as fh:
                     b = json.load(fh)
                 self.eager = set(b["eager"])
-                self._baseline = ["ok", b["status"], b["fingerprint"], set(b["unstable"])]
+                self._baseline = ["ok", b["status"], b["fingerprint"], set(b["unstable"]), b.get("keys", {})]
+                _state_base["fp"] = b["fingerprint"]
             except (OSError, ValueError, KeyError):
                 a = self.import_state({})
-                self._baseline = a + [set()] if a[0] == "ok" else a
+                self._baseline = a[:3] + [set(), a[3]] if a[0] == "ok" else a
         return self._baseline
 
     def class_of(self, n):
@@ -313,19 +314,26 @@ def _install(patched, probe=False):
     return recorder
 
 
+_state_base = {}
+
+
 def _state_child(patched, wfd, only=None):
     out = os.fdopen(wfd, "w")
     _install(patched)
-    from .state import fingerprint, import_all
+    from .state import fingerprint, import_all, table_keys
 
     try:
         status = import_all(only)
         fp = fingerprint()
+        base = _state_base.get("fp")
+        # per-key detail only for tables that changed (the unpatched digests
+        # were loaded before this child was forked)
+        keys = table_keys([p for p, d in fp.items() if base is not None and base.get(p) != d])
     except BaseException as e:  # noqa: BLE001
         out.write(json.dumps(["error", repr(e)[:300]]))
         out.flush()
         return
-    out.write(json.dumps(["ok", status, fp]))
+    out.write(json.dumps(["ok", status, fp, keys]))
     out.flush()
 
 

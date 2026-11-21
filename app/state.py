@@ -119,6 +119,125 @@ def import_all(only=None):
     return status
 
 
+def _expr_names():
+    try:
+        core = sys.modules.get("sqlglot.expressions.core") or importlib.import_module("sqlglot.expressions.core")
+    except Exception:  # noqa: BLE001
+        return {}
+    out = {}
+    todo = [core.Expr]
+    while todo:
+        c = todo.pop()
+        for sub in c.__subclasses__():
+            if sub.__name__ not in out:
+                out[sub.__name__] = sub
+                todo.append(sub)
+    return out
+
+
+def _classes_in(v, names, depth=0):
+    """Expression class names a table key or value refers to: the class itself,
+    a classmethod's class, names a function's code uses, closure/partial args."""
+    found = set()
+    if depth > 3:
+        return found
+    if isinstance(v, type):
+        if v.__name__ in names and names[v.__name__] is v:
+            found.add(v.__name__)
+        return found
+    if isinstance(v, (types.FunctionType, types.MethodType)):
+        f = getattr(v, "__func__", v)
+        owner = getattr(v, "__self__", None)
+        if isinstance(owner, type):
+            found |= _classes_in(owner, names, depth + 1)
+        code = getattr(f, "__code__", None)
+        if code is not None:
+            stack = [code]
+            while stack:
+                co = stack.pop()
+                found |= {n for n in co.co_names if n in names}
+                stack.extend(c for c in co.co_consts if isinstance(c, types.CodeType))
+        for cell in getattr(f, "__closure__", None) or ():
+            try:
+                found |= _classes_in(cell.cell_contents, names, depth + 1)
+            except ValueError:
+                pass
+        return found
+    if isinstance(v, functools.partial):
+        found |= _classes_in(v.func, names, depth + 1)
+        for a in list(v.args) + list(v.keywords.values()):
+            found |= _classes_in(a, names, depth + 1)
+        return found
+    if isinstance(v, (tuple, list, set, frozenset)):
+        for x in list(v)[:50]:
+            found |= _classes_in(x, names, depth + 1)
+    return found
+
+
+def table_keys(only=None):
+    """For dict-valued module/class attributes (or just the paths in `only`):
+    {path: {key digest: "value digest|ExprClass,ExprClass"}}, so a change can
+    be narrowed to the keys it touched and the expression classes those keys
+    dispatch."""
+    names = _expr_names()
+    out = {}
+    if only is not None:
+        for path in only:
+            mod, _, attr = path.partition(":")
+            v = sys.modules.get(mod)
+            for part in attr.split("."):
+                v = vars(v).get(part) if v is not None and hasattr(v, "__dict__") else None
+            if isinstance(v, dict) and 0 < len(v) <= MAX_ITEMS:
+                out[path] = {
+                    _d(k, 0, frozenset()): _h(_d(x, 0, frozenset())) + "|"
+                    + ",".join(sorted(_classes_in(k, names) | _classes_in(x, names)))
+                    for k, x in v.items()
+                }
+        return out
+
+    def visit(path, v, modname, depth):
+        if isinstance(v, type) and v.__module__ == modname and depth < 4:
+            for attr, x in sorted(vars(v).items(), key=lambda kv: kv[0]):
+                if not attr.startswith("__"):
+                    visit(f"{path}.{attr}", x, modname, depth + 1)
+            return
+        if isinstance(v, dict) and 0 < len(v) <= MAX_ITEMS:
+            entry = {}
+            for k, x in v.items():
+                kd = _d(k, 0, frozenset())
+                cls = sorted(_classes_in(k, names) | _classes_in(x, names))
+                entry[kd] = _h(_d(x, 0, frozenset())) + "|" + ",".join(cls)
+            out[path] = entry
+
+    for name, mod in sorted(sys.modules.items()):
+        if not (name == "sqlglot" or name.startswith("sqlglot.")) or mod is None:
+            continue
+        for attr, v in sorted(vars(mod).items(), key=lambda kv: kv[0]):
+            if not attr.startswith("__"):
+                visit(f"{name}:{attr}", v, name, 0)
+    return out
+
+
+def changed_keys(base_keys, keys, path):
+    """-> set of expression class names the changed keys of a table involve,
+    or None when the table is not a dict here or some changed key names none."""
+    a, b = base_keys.get(path), keys.get(path)
+    if a is None or b is None:
+        return None
+    classes = set()
+    for k in set(a) | set(b):
+        if a.get(k) == b.get(k):
+            continue
+        involved = set()
+        for side in (a.get(k), b.get(k)):
+            if side:
+                involved |= {c for c in side.split("|", 1)[1].split(",") if c}
+        if not involved:
+            return None
+        classes |= involved
+    return classes
+
+
 def fingerprint():
     """{"module:attr.path": digest} for module- and class-level state."""
     out = {}
@@ -173,19 +292,19 @@ def build_baseline(out_path, runs=3):
 
     results = []
     for _ in range(runs):
-        r = subprocess.run([sys.executable, "-c", "import json; from app.state import import_all, fingerprint; "
-                            "s = import_all(); print(json.dumps([s, fingerprint()]))"],
+        r = subprocess.run([sys.executable, "-c", "import json; from app.state import import_all, fingerprint, table_keys; "
+                            "s = import_all(); print(json.dumps([s, fingerprint(), table_keys()]))"],
                            capture_output=True, text=True, check=True)
         results.append(json.loads(r.stdout))
-    status, fp = results[0]
+    status, fp, keys = results[0]
     unstable = set()
-    for _, other in results[1:]:
+    for _, other, _k in results[1:]:
         unstable |= set(diff(fp, other))
     eager = json.loads(subprocess.run(
         [sys.executable, "-c", "import json, sys, sqlglot; print(json.dumps(sorted(m for m in sys.modules if m.startswith('sqlglot'))))"],
         capture_output=True, text=True, check=True).stdout)
     with open(out_path, "w") as fh:
-        json.dump({"status": status, "fingerprint": fp, "unstable": sorted(unstable), "eager": eager}, fh)
+        json.dump({"status": status, "fingerprint": fp, "keys": keys, "unstable": sorted(unstable), "eager": eager}, fh)
     print(f"baseline: {len(fp)} attributes, {len(unstable)} unstable", file=sys.stderr)
 
 

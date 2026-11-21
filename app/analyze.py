@@ -26,6 +26,10 @@ DIALECT_DIRS = (
 )
 # A name on more source lines than this is too generic to search for.
 GENERIC_REFS = 60
+# Class attributes sqlglot reads once per class into a run-time cache: the
+# generator's dispatch table is built from TRANSFORMS (and `<key>_sql`
+# methods) on first use (sqlglot/generator.py, _build_dispatch).
+CACHED_DISPATCH = {"TRANSFORMS"}
 # An attribute name whose referring lines reach more tests than this is too
 # common to stand for one class's attribute.
 BROAD_TESTS = 300
@@ -211,17 +215,20 @@ class Analyzer:
         self.runtime_part |= fresh
         return t | fresh, w + (f"+import->{len(fresh)}" if fresh else "")
 
-    def state_tests(self, paths):
+    def state_tests(self, paths, table_classes=None):
         """Tests that can see attributes whose import-time value changed
         (paths "module:Class.ATTR" from app/state.py):
         - tests that created an expression of that class (functions are
           dispatched by name, so no executed line has to name the class);
+        - for a dict table whose changed keys all name expression classes
+          (TRANSFORMS by class, FUNCTIONS by the class built): tests that
+          created those expressions (within the dialect's tests);
         - in a dialect's modules: tests running code that names the attribute,
-          among the tests using the dialect. A generic table name (TRANSFORMS,
-          FUNCTIONS, ...) or a name no executed line mentions selects every
-          test using the dialect: such tables feed caches built on first use
-          (the generator's dispatch table), which coverage charges to one test.
-          A `<key>_sql` method also selects tests that created that expression;
+          among the tests using the dialect. TRANSFORMS selects every test
+          using the dialect: the generator builds its dispatch table from it
+          once per class and caches it, so coverage charges the read to one
+          test. A `<key>_sql` method (also in that table) selects tests that
+          created that expression;
         - elsewhere: tests running code that names the attribute, or its
           class's name when the attribute name is read almost everywhere."""
         out = set()
@@ -235,15 +242,26 @@ class Analyzer:
             if self.text(f) is None:
                 f = mod.replace(".", "/") + "/__init__.py"
             fam = self.family(f)
+            tc = (table_classes or {}).get(p)
+            if tc is not None:
+                # a table whose changed keys all name expression classes: only
+                # tests that created those expressions can hit those entries
+                hits = set()
+                for name in tc:
+                    hits |= self.expr_instances(name)
+                out |= hits & self.family_tests(fam) if fam else hits
+                continue
             if fam:
                 users = self.family_tests(fam)
-                if self.refcount(leaf) > GENERIC_REFS:
+                if leaf in CACHED_DISPATCH:
+                    # read once per class into a cache (Generator dispatch), so
+                    # coverage charges the read to a single test
                     out |= users
                     continue
                 hits = self.referring_cached(leaf) & users
                 if leaf.endswith("_sql"):
                     hits |= self.expr_instances(leaf[: -len("_sql")]) & users
-                out |= hits if hits else users
+                out |= hits
                 continue
             broad = classes and (self.refcount(leaf) > GENERIC_REFS or len(self.referring_cached(leaf)) > BROAD_TESTS)
             refs = {classes[-1], classes[-1].lower() + "_sql"} if broad else {leaf}
