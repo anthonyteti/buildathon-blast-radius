@@ -22,6 +22,10 @@ pinned commit (`maps/coverage.json.gz`, rebuilt with `tools/build_maps.sh`):
 - **file reads and directory listings** per test (fixtures, data files).
 - **dialect use** per test: which modules' Dialect/Tokenizer/Parser/Generator
   classes each test instantiated.
+- **expression classes** per test: which `sqlglot.expressions` classes (and
+  their bases) each test created. Functions are dispatched by name (parser
+  `FUNCTIONS` tables, `<key>_sql` generator methods), so a test can depend on a
+  class without running a line that names it.
 - **static import graph** of `sqlglot/` and `tests/`.
 - **CPU cost of running each test in-process** (`maps/cpu.json`,
   `tools/measure_cpu.py`), scaled to the recorded seconds.
@@ -54,10 +58,12 @@ whose import runs them are imported and compared:
 
 - a module that imported before now fails to import: every test;
 - no attribute changed: nothing beyond the coverage of the changed lines;
-- otherwise: tests running code that names a changed attribute (its class's
-  name when the attribute name is everywhere), limited to tests that use the
-  dialect when the module belongs to one, plus tests that import sqlglot in a
-  subprocess.
+- otherwise: tests that created an expression of a class whose attribute
+  changed, plus tests running code that names a changed attribute. In a
+  dialect's modules those are limited to tests that use the dialect; elsewhere
+  an attribute name read almost everywhere is replaced by its class's name.
+  Tests that import sqlglot in a subprocess are added when an eagerly
+  imported module changed.
 
 When that check cannot run, the static fallback selects by the names the
 statement defines.

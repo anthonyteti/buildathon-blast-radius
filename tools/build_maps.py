@@ -24,6 +24,8 @@ commit. Layout:
   opens      {path: set index} tests that open()ed the file
   lists      {dir: set index}  tests that listed the directory
   subprocess [set index]  tests that start subprocesses
+  expr_classes {"module:Class": set index}  tests that created an expression
+             of that class or a subclass
   uses       {module file: set index}  tests that created a Dialect, Tokenizer,
              Parser or Generator instance of a class defined in that module
 """
@@ -135,6 +137,7 @@ opens = defaultdict(set)
 lists = defaultdict(set)
 spawners = set()
 uses = defaultdict(set)
+exprs = defaultdict(set)
 for p in glob.glob(os.path.join(cov_dir, "opens.*.jsonl")) + (
     glob.glob(os.path.join(lazy_dir, "opens.*.jsonl")) if lazy_dir else []
 ):
@@ -149,6 +152,9 @@ for p in glob.glob(os.path.join(cov_dir, "opens.*.jsonl")) + (
             continue
         if kind == "subprocess":
             spawners |= s
+            continue
+        if kind == "expr":
+            exprs[path] |= s
             continue
         if kind == "use":
             f = path.replace(".", "/") + ".py"
@@ -184,6 +190,7 @@ out = {
     "preimport": {f: sorted(ls) for f, ls in sorted(preimport.items())},
     "subprocess": [intern(spawners)] if spawners else [],
     "uses": {f: intern(s) for f, s in sorted(uses.items())},
+    "expr_classes": {c: intern(s) for c, s in sorted(exprs.items())},
 }
 
 

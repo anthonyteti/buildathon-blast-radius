@@ -135,7 +135,12 @@ class Analyzer:
                 t = set(self.maps.by_file.get(path, set())) | self.importer_tests(path)
                 return t, f"syntax-error->{len(t)}"
             return ALL, "syntax-error"
-        if _dump_without_docstrings(t0) == _dump_without_docstrings(t1):
+        old_changed = set()
+        new_changed = set()
+        for r in regions:
+            old_changed.update(r.removed or [r.before, r.before + 1])
+            new_changed.update(r.added)
+        if _same_code(t0, t1, old_changed, new_changed):
             return set(), "same-ast"  # comments, formatting or docstrings only
         ctx = FileCtx(path, old, t0)
         nctx = FileCtx(path, new, t1)
@@ -198,29 +203,32 @@ class Analyzer:
         return t | fresh, w + (f"+import->{len(fresh)}" if fresh else "")
 
     def state_tests(self, paths):
-        """Tests that run code naming attributes whose import-time value
-        changed (paths "module:Class.ATTR" from app/state.py). An attribute
-        name read almost everywhere (e.g. one a metaclass derives for every
-        expression class) is replaced by its class name, like names() does.
-        Dialect modules are limited to the tests using that dialect."""
+        """Tests that can see attributes whose import-time value changed
+        (paths "module:Class.ATTR" from app/state.py):
+        - tests that created an expression of that class (functions are
+          dispatched by name, so no executed line has to name the class);
+        - tests running code that names the attribute. In a dialect's modules
+          that is limited to tests using the dialect; elsewhere a name read
+          almost everywhere is replaced by its class's name, like names()."""
         by_file = {}
+        out = set()
         for p in paths:
             mod, _, attr = p.partition(":")
             parts = attr.split(".")
             leaf, classes = parts[-1], parts[:-1]
+            if classes:
+                out |= self.maps.instantiated(mod + ":" + ".".join(classes))
             f = mod.replace(".", "/") + ".py"
             if self.text(f) is None:
                 f = mod.replace(".", "/") + "/__init__.py"
             refs = by_file.setdefault(f, set())
-            broad = self.refcount(leaf) > GENERIC_REFS
-            if not broad and self.family(f) is None:
-                # outside dialect modules nothing else narrows a hot attribute name
-                broad = len(self.referring_cached(leaf)) > BROAD_TESTS
-            if classes and broad:
+            broad = False
+            if classes and self.family(f) is None:
+                broad = self.refcount(leaf) > GENERIC_REFS or len(self.referring_cached(leaf)) > BROAD_TESTS
+            if broad:
                 refs |= {classes[-1], classes[-1].lower() + "_sql"}
             else:
                 refs.add(leaf)
-        out = set()
         for f, refs in by_file.items():
             hits = self.referring(refs)
             fam = self.family(f)
@@ -261,22 +269,29 @@ class Analyzer:
                         elif isinstance(x, ast.Attribute):
                             names.add(x.attr)
         refs = set()
+        fam_path = self.family(ctx.path)
         for n in names:
-            if self.refcount(n) > GENERIC_REFS and cls is not None:
+            # in a dialect's modules the dialect filter below narrows enough
+            if self.refcount(n) > GENERIC_REFS and cls is not None and fam_path is None:
                 refs |= {cls.name, cls.name.lower() + "_sql"}
             else:
                 refs.add(n)
         if not refs and cls is not None:
             refs = {cls.name, cls.name.lower() + "_sql"}
+        inst = set()
+        if cls is not None:
+            mod = ctx.path[:-3].replace("/", ".")
+            mod = mod[: -len(".__init__")] if mod.endswith(".__init__") else mod
+            inst = self.maps.instantiated(mod + ":" + cls.name)
         if not refs:
-            t = self.maps.file_tests(ctx.path)
+            t = self.maps.file_tests(ctx.path) | inst
             return t, "module-any"
         hits = self.referring(refs)
         fam = self.family(ctx.path)
         if fam:
             fam_tests = self.family_tests(fam)
             hits &= fam_tests
-        return hits, "names[" + ",".join(sorted(refs)) + "]"
+        return hits | inst, "names[" + ",".join(sorted(refs)) + "]" + (f"+instances->{len(inst)}" if inst else "")
 
     def preimport_lines(self, path):
         if path not in self._preimport_sets:
@@ -525,7 +540,22 @@ class FileCtx:
         return best
 
 
-def _dump_without_docstrings(tree):
+_PLAIN_DECORATORS = {"staticmethod", "classmethod", "property"}
+_DEFS = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _postponed(tree):
+    return any(
+        isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations" for a in n.names)
+        for n in tree.body
+    )
+
+
+def _is_doc(st):
+    return isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str)
+
+
+def _dump(node, lazy, in_function):
     """ast.dump without what cannot change behaviour here (in place: callers
     only need positions afterwards):
     - docstrings: no test runs doctests (tests/test_docs.py uses unittest's
@@ -534,27 +564,70 @@ def _dump_without_docstrings(tree):
     - argument/return annotations of undecorated functions in modules with
       `from __future__ import annotations` (kept as strings, never evaluated;
       decorated functions keep theirs, e.g. for singledispatch)."""
-    lazy = any(
-        isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(a.name == "annotations" for a in n.names)
-        for n in tree.body
-    )
-    plain = {"staticmethod", "classmethod", "property"}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            b = node.body
-            if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
-                b[0].value.value = ""
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for sub in ast.walk(node):
-                if sub is not node and isinstance(sub, ast.AnnAssign) and sub.simple:
-                    sub.annotation = ast.Constant("")
-            if lazy and all(isinstance(d, ast.Name) and d.id in plain for d in node.decorator_list):
-                a = node.args
+    stack = [(node, in_function)]
+    while stack:
+        n, inside = stack.pop()
+        if isinstance(n, (ast.Module, ast.ClassDef) + _DEFS) and n.body and _is_doc(n.body[0]):
+            n.body[0].value.value = ""
+        if inside and isinstance(n, ast.AnnAssign) and n.simple:
+            n.annotation = ast.Constant("")
+        if isinstance(n, _DEFS):
+            if lazy and all(isinstance(d, ast.Name) and d.id in _PLAIN_DECORATORS for d in n.decorator_list):
+                a = n.args
                 for arg in a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg]:
                     if arg is not None:
                         arg.annotation = None
-                node.returns = None
-    return ast.dump(tree)
+                n.returns = None
+        child_inside = inside or isinstance(n, _DEFS + (ast.Lambda,))
+        for c in ast.iter_child_nodes(n):
+            stack.append((c, child_inside))
+    return ast.dump(node)
+
+
+def _same_code(t0, t1, old_changed, new_changed):
+    """Same program apart from comments, formatting, docstrings and
+    never-evaluated annotations. Text outside the hunks is identical, so only
+    statements overlapping a changed line are compared; class and function
+    bodies are compared statement by statement when their headers match."""
+    lazy = _postponed(t0) and _postponed(t1)
+
+    def span(st):
+        start = min([d.lineno for d in getattr(st, "decorator_list", [])] + [st.lineno])
+        return start, st.end_lineno
+
+    def touches(st, lines):
+        a, b = span(st)
+        return any(a <= ln <= b for ln in lines)
+
+    def header(st, inside):
+        body = st.body
+        st.body = []
+        try:
+            return _dump(st, lazy, inside)
+        finally:
+            st.body = body
+
+    def same(b0, b1, inside, doc_ok):
+        if len(b0) != len(b1):
+            return False
+        for i, (o, n) in enumerate(zip(b0, b1)):
+            if not touches(o, old_changed) and not touches(n, new_changed):
+                continue
+            if type(o) is not type(n):
+                return False
+            if i == 0 and doc_ok and _is_doc(o) and _is_doc(n):
+                continue
+            if isinstance(o, (ast.ClassDef,) + _DEFS):
+                if header(o, inside) != header(n, inside):
+                    return False
+                if not same(o.body, n.body, inside or isinstance(o, _DEFS), True):
+                    return False
+                continue
+            if _dump(o, lazy, inside) != _dump(n, lazy, inside):
+                return False
+        return True
+
+    return same(t0.body, t1.body, False, True)
 
 
 def _code_lines(source):

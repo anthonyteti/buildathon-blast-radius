@@ -77,12 +77,12 @@ def plan_skip(cands, ms, cpu, verifiable, p_none, setup_ms):
     # cheaper candidates, cheapest first, within a CPU budget; the rest stay selected
     pool = sorted((t for t in cands if t in verifiable and t not in heavy and cpu[t] <= MAX_VERIFY_MS),
                   key=lambda t: (cpu[t], t))
-    v, spent = [], 0
+    # setUpClass costs count against the budget too (TestExecutor's is 1.5 s)
+    v = []
     for t in pool:
-        if spent + cpu[t] > SKIP_BUDGET_MS and v:
-            break
+        if v and setup_ms(v + [t]) + sum(cpu[x] for x in v) + cpu[t] > SKIP_BUDGET_MS + setup_ms([]):
+            continue
         v.append(t)
-        spent += cpu[t]
     if not v:
         return 0.0, []
     vs = set(v)

@@ -177,4 +177,34 @@ for _mod, _name in (
 ):
     _record_use(_mod, _name)
 
+# Which tests create which expression classes: functions are dispatched by
+# name (parser FUNCTIONS tables, `<key>_sql` generator methods), so a test can
+# depend on exp.Date without running any line that names it. Every sqlglot class
+# in the instance's MRO is recorded, once per test phase.
+_expr_seen = {}
+
+
+def _record_expr():
+    try:
+        Expr = _il.import_module("sqlglot.expressions.core").Expr
+    except Exception:
+        return
+    orig = Expr.__init__
+
+    def __init__(self, *a, **k):
+        cls = type(self)
+        seen = _expr_seen.setdefault(_current["ctx"], set())
+        if cls not in seen:
+            seen.add(cls)
+            for c in cls.__mro__:
+                m = getattr(c, "__module__", "") or ""
+                if m.startswith("sqlglot."):
+                    _reads.add((_current["ctx"], "expr", m + ":" + c.__qualname__))
+        return orig(self, *a, **k)
+
+    Expr.__init__ = __init__
+
+
+_record_expr()
+
 _switch("collect|" + os.environ.get("COVMAP_FILE", "?"))

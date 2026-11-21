@@ -32,7 +32,7 @@ class Verifier:
         self.cpu_children = 0.0
         self.heavy_loaded = False
 
-    def import_state(self, patched, budget=30.0, only=None):
+    def import_state(self, patched, budget=8.0, only=None):
         """Import all of sqlglot with the patch applied, in a child.
         -> ["error", message] or ["ok", {module: import error or None}, fingerprint]."""
         return _state_parent(self, patched, budget, only)

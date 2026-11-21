@@ -19,6 +19,7 @@ class Maps:
         self.imports = m.get("imports", {})
         self.imports_top = m.get("imports_top", self.imports)
         self.uses = m.get("uses", {})
+        self.expr_classes = m.get("expr_classes", {})
         # measured in-process CPU (tools/measure_cpu.py), scaled to tests.json's machine
         self.class_setup = {}
         self.cpu_ms = {}
@@ -91,6 +92,11 @@ class Maps:
         """Tests that created a Dialect/Tokenizer/Parser/Generator from a class
         defined in this module."""
         idx = self.uses.get(path)
+        return set(self.set(idx)) if idx is not None else set()
+
+    def instantiated(self, cls_key: str) -> set:
+        """Tests that created an expression of class "module:Qualname" or a subclass."""
+        idx = self.expr_classes.get(cls_key)
         return set(self.set(idx)) if idx is not None else set()
 
     def opened(self, path: str) -> set:
