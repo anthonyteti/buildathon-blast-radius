@@ -62,10 +62,22 @@ whose import runs them are imported and compared:
 
 - a module that imported before now fails to import: every test;
 - no attribute changed: nothing beyond the coverage of the changed lines;
+- a dict table defined in a class body (`KEYWORDS`, `NUMERIC_ESCAPES`,
+  `FUNCTIONS`, ...): the tests that looked up a changed key, read the whole
+  table (iterated, copied, merged, compared), or read its size when keys were
+  added or removed (`maps/keys.json.gz`, `tools/keytrace.py`). The trace runs
+  every test in its own forked child of a process that has imported sqlglot
+  but run nothing, so no cache one test builds (e.g. the generator's dispatch
+  table from `TRANSFORMS`) hides a lookup from another. Keys equal under dict
+  lookup share a digest (a str-valued enum and its string, `True` and `1`).
+  Tables also bound at module level or referenced from anywhere but class
+  bodies when the trace starts are not narrowed this way; a table read while
+  pytest imports a test file counts as read whole by every test of that file;
 - a dict table (`TRANSFORMS`, `FUNCTIONS`, ...) whose changed keys all name
   expression classes (the key itself, or the class a parser entry builds):
-  tests that created those expressions, within the dialect's tests. The
-  per-key digests are compared only for tables whose digest changed;
+  tests that created those expressions, within the dialect's tests (and
+  within the key trace above, when there is one). The per-key digests are
+  compared only for tables whose digest changed;
 - otherwise: tests that created an expression of a class whose attribute
   changed, plus tests running code that names a changed attribute. In a
   dialect's modules those are limited to tests that use the dialect (all of
@@ -143,6 +155,9 @@ table from patches or kinds of edit to failing tests.
 - `maps/coverage.json.gz`: the maps (test sets stored as hex bitmasks over the map's test list).
 - `maps/cpu.json`: in-process CPU per test and per `setUpClass`.
 - `maps/jobs.json.gz`: per-job coverage of pool-based tests (loaded on demand).
+- `maps/keys.json.gz`: which tests looked up which keys of class-level dict
+  tables (loaded on demand; `tools/build_keys.sh` runs `run_keytrace.sh` with
+  `keytrace.py` inside the submission image, then `build_keys.py`).
 - `tools/`: how the maps are built (`build_maps.sh` runs `run_coverage.sh` twice
   with `covplugin.py` inside the submission image, then `build_maps.py`;
   `measure_cpu.py` writes `maps/cpu.json`), and

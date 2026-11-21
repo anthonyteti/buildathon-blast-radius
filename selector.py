@@ -122,12 +122,15 @@ def import_checks(commits, analyzer, verifier, start):
             c.why += f" | patched import breaks {broken[:3]}"
             continue
         changed = [p for p in state.diff(base[2], st[2], modules=set(st[1])) if p not in unstable]
-        tables = {}
+        tables, keys = {}, {}
         for p in changed:
             tc = state.changed_keys(base[4], st[3], p)
             if tc is not None:
                 tables[p] = tc
-        fp_tests = analyzer.state_tests(changed, tables)
+            kd = state.changed_key_digests(base[4], st[3], p)
+            if kd is not None:
+                keys[p] = kd
+        fp_tests = analyzer.state_tests(changed, tables, keys)
         eager = verifier.eager
         if any(eager is None or p.split(":", 1)[0] in eager for p in changed):
             # tests that run `import sqlglot` in a fresh subprocess see what it loads

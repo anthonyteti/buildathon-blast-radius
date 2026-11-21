@@ -119,6 +119,38 @@ class Maps:
                     mask |= int(m, 16)
         return entry["count"], {i for i in range(entry["count"]) if mask >> i & 1}
 
+    def key_access(self, path, digests, size_changed):
+        """Tests that can see a change to these keys of a class-level dict
+        table (maps/keys.json.gz, tools/keytrace.py): tests that looked up one
+        of them, read the whole table, or (when keys were added or removed)
+        its size; plus every test the trace has no record of. None when the
+        table was not traced."""
+        if getattr(self, "_keys", None) is None:
+            try:
+                with gzip.open(os.path.join(MAPS, "keys.json.gz"), "rb") as fh:
+                    k = json.loads(fh.read())
+                number = {t["id"]: t["number"] for t in self.tests}
+                slots = [number.get(t) for t in k["tests"]]
+                k["untraced_tests"] = self.all - {n for n in slots if n is not None}
+                k["slots"] = slots
+                self._keys = k
+            except (OSError, ValueError, KeyError):
+                self._keys = {}
+        k = self._keys
+        if not k:
+            return None
+        entry = k["tables"].get(k["aliases"].get(path, path))
+        if entry is None:
+            return None
+        out = set(k["untraced_tests"])
+        wanted = set(digests) | {"*"} | ({"#size"} if size_changed else set())
+        for kd in wanted:
+            idx = entry.get(kd)
+            if idx is not None:
+                bits = bin(int(k["sets"][idx], 16))[:1:-1]
+                out |= {k["slots"][i] for i, b in enumerate(bits) if b == "1" and k["slots"][i] is not None}
+        return out
+
     def instantiated(self, cls_key: str) -> set:
         """Tests that created an expression of class "module:Qualname" or a subclass."""
         idx = self.expr_classes.get(cls_key)

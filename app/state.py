@@ -187,12 +187,9 @@ def table_keys(only=None):
             v = sys.modules.get(mod)
             for part in attr.split("."):
                 v = vars(v).get(part) if v is not None and hasattr(v, "__dict__") else None
-            if isinstance(v, dict) and 0 < len(v) <= MAX_ITEMS:
-                out[path] = {
-                    _d(k, 0, frozenset()): _h(_d(x, 0, frozenset())) + "|"
-                    + ",".join(sorted(_classes_in(k, names) | _classes_in(x, names)))
-                    for k, x in v.items()
-                }
+            entry = _table_entry(v, names)
+            if entry is not None:
+                out[path] = entry
         return out
 
     def visit(path, v, modname, depth):
@@ -201,12 +198,8 @@ def table_keys(only=None):
                 if not attr.startswith("__"):
                     visit(f"{path}.{attr}", x, modname, depth + 1)
             return
-        if isinstance(v, dict) and 0 < len(v) <= MAX_ITEMS:
-            entry = {}
-            for k, x in v.items():
-                kd = _d(k, 0, frozenset())
-                cls = sorted(_classes_in(k, names) | _classes_in(x, names))
-                entry[kd] = _h(_d(x, 0, frozenset())) + "|" + ",".join(cls)
+        entry = _table_entry(v, names)
+        if entry is not None:
             out[path] = entry
 
     for name, mod in sorted(sys.modules.items()):
@@ -218,6 +211,55 @@ def table_keys(only=None):
     return out
 
 
+SIZE_KEY = "#len"  # table entry holding len(table)
+
+
+def key_digest(k):
+    """Digest of a table key such that keys a dict lookup treats as equal get
+    the same digest: str subclasses (str-valued enums) by their string, ints,
+    bools, int-valued enums and whole floats by their int value. Used both for
+    the per-key access traces (tools/keytrace.py) and for changed keys."""
+    if isinstance(k, str):
+        return "s:" + str.__str__(k)
+    if isinstance(k, int):
+        return "n:" + repr(int(k))
+    if isinstance(k, float) and k.is_integer():
+        return "n:" + repr(int(k))
+    if isinstance(k, tuple):
+        return "t:(" + ",".join(key_digest(x) for x in k) + ")"
+    if isinstance(k, frozenset):
+        return "f:{" + ",".join(sorted(key_digest(x) for x in k)) + "}"
+    return _d(k, 0, frozenset())
+
+
+def _table_entry(v, names):
+    """{key digest: "value digest|ExprClass,..."} for a dict table, or None.
+    Keys with the same digest (equal under dict lookup) share one entry."""
+    if not (isinstance(v, dict) and 0 < len(v) <= MAX_ITEMS):
+        return None
+    groups = {}
+    for k, x in v.items():
+        groups.setdefault(key_digest(k), []).append(
+            (_h(_d(x, 0, frozenset())), _classes_in(k, names) | _classes_in(x, names)))
+    entry = {}
+    for kd, items in groups.items():
+        h = items[0][0] if len(items) == 1 else _h(";".join(sorted(i[0] for i in items)))
+        entry[kd] = h + "|" + ",".join(sorted(set().union(*(i[1] for i in items))))
+    entry[SIZE_KEY] = f"{len(v)}|"
+    return entry
+
+
+def changed_key_digests(base_keys, keys, path):
+    """-> (digests of the keys of a dict table that were added, removed or
+    whose value changed, whether keys were added or removed), or None when
+    either side has no per-key detail."""
+    a, b = base_keys.get(path), keys.get(path)
+    if a is None or b is None:
+        return None
+    changed = {k for k in set(a) | set(b) if a.get(k) != b.get(k)}
+    return changed - {SIZE_KEY}, SIZE_KEY in changed
+
+
 def changed_keys(base_keys, keys, path):
     """-> set of expression class names the changed keys of a table involve,
     or None when the table is not a dict here or some changed key names none."""
@@ -226,7 +268,7 @@ def changed_keys(base_keys, keys, path):
         return None
     classes = set()
     for k in set(a) | set(b):
-        if a.get(k) == b.get(k):
+        if a.get(k) == b.get(k) or k == SIZE_KEY:
             continue
         involved = set()
         for side in (a.get(k), b.get(k)):

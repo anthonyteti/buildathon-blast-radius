@@ -215,11 +215,14 @@ class Analyzer:
         self.runtime_part |= fresh
         return t | fresh, w + (f"+import->{len(fresh)}" if fresh else "")
 
-    def state_tests(self, paths, table_classes=None):
+    def state_tests(self, paths, table_classes=None, table_keys=None):
         """Tests that can see attributes whose import-time value changed
         (paths "module:Class.ATTR" from app/state.py):
         - tests that created an expression of that class (functions are
           dispatched by name, so no executed line has to name the class);
+        - for a class-level dict table with a per-test key trace: tests that
+          looked up a changed key, read the whole table, or its size when keys
+          were added or removed;
         - for a dict table whose changed keys all name expression classes
           (TRANSFORMS by class, FUNCTIONS by the class built): tests that
           created those expressions (within the dialect's tests);
@@ -242,6 +245,8 @@ class Analyzer:
             if self.text(f) is None:
                 f = mod.replace(".", "/") + "/__init__.py"
             fam = self.family(f)
+            tk = (table_keys or {}).get(p)
+            traced = self.maps.key_access(p, *tk) if tk is not None else None
             tc = (table_classes or {}).get(p)
             if tc is not None:
                 # a table whose changed keys all name expression classes: only
@@ -249,7 +254,14 @@ class Analyzer:
                 hits = set()
                 for name in tc:
                     hits |= self.expr_instances(name)
-                out |= hits & self.family_tests(fam) if fam else hits
+                hits = hits & self.family_tests(fam) if fam else hits
+                out |= hits & traced if traced is not None else hits
+                continue
+            if traced is not None:
+                # a per-test trace of who looked up which key of this table
+                # (each test in a fresh process, so no cache hides a read):
+                # only those keys changed
+                out |= traced
                 continue
             if fam:
                 users = self.family_tests(fam)
