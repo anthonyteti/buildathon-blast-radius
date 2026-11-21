@@ -63,7 +63,11 @@ class Analyzer:
         self.import_time = False
         self.names_part = set()  # import-time guesses by names (replaced by app/state.py when it can run)
         self.runtime_part = set()  # everything else
+        self.looked_up = {}  # {file: lines} whose coverage selected tests
+        self.whole_file = False  # selection not reducible to line lookups
         t, w = self._analyze(fd)
+        if not self.is_python(fd) or self.import_time:
+            self.whole_file = True
         if t is not ALL and not self.is_python(fd):
             self.runtime_part |= t
         return t, w
@@ -173,13 +177,17 @@ class Analyzer:
             # signature, defaults or decorators: everything that called it ran its body.
             # Defaults and decorators are evaluated at import time.
             body = fn.body
-            t = self.maps.line_tests(path, range(body[0].lineno, fn.end_lineno + 1))
+            lines = range(body[0].lineno, fn.end_lineno + 1)
+            t = self.maps.line_tests(path, lines)
+            self.looked_up.setdefault(path, set()).update(lines)
             self.runtime_part |= t
             if path.startswith("sqlglot/"):
                 self.import_time = True
             return t, "def"
         if fn is not None:
-            t = self.maps.line_tests(path, ctx.stmt_lines(line))
+            lines = ctx.stmt_lines(line)
+            t = self.maps.line_tests(path, lines)
+            self.looked_up.setdefault(path, set()).update(lines)
             self.runtime_part |= t
             if path.startswith("sqlglot/") and line in self.preimport_lines(path) and isinstance(fn, ast.FunctionDef):
                 # a function that also runs while sqlglot is imported (metaclasses,
@@ -191,6 +199,7 @@ class Analyzer:
             # module/class level in a test file runs at collection: the map
             # charges those lines to every test of every file importing it
             t = self.maps.line_tests(path, ctx.stmt_lines(line))
+            self.whole_file = True
             self.runtime_part |= t
             return t, "cov-collect"
         # import-time code: by names, plus tests that ran it in a fresh
@@ -207,10 +216,14 @@ class Analyzer:
         (paths "module:Class.ATTR" from app/state.py):
         - tests that created an expression of that class (functions are
           dispatched by name, so no executed line has to name the class);
-        - tests running code that names the attribute. In a dialect's modules
-          that is limited to tests using the dialect; elsewhere a name read
-          almost everywhere is replaced by its class's name, like names()."""
-        by_file = {}
+        - in a dialect's modules: tests running code that names the attribute,
+          among the tests using the dialect. A generic table name (TRANSFORMS,
+          FUNCTIONS, ...) or a name no executed line mentions selects every
+          test using the dialect: such tables feed caches built on first use
+          (the generator's dispatch table), which coverage charges to one test.
+          A `<key>_sql` method also selects tests that created that expression;
+        - elsewhere: tests running code that names the attribute, or its
+          class's name when the attribute name is read almost everywhere."""
         out = set()
         for p in paths:
             mod, _, attr = p.partition(":")
@@ -221,20 +234,30 @@ class Analyzer:
             f = mod.replace(".", "/") + ".py"
             if self.text(f) is None:
                 f = mod.replace(".", "/") + "/__init__.py"
-            refs = by_file.setdefault(f, set())
-            broad = False
-            if classes and self.family(f) is None:
-                broad = self.refcount(leaf) > GENERIC_REFS or len(self.referring_cached(leaf)) > BROAD_TESTS
-            if broad:
-                refs |= {classes[-1], classes[-1].lower() + "_sql"}
-            else:
-                refs.add(leaf)
-        for f, refs in by_file.items():
-            hits = self.referring(refs)
             fam = self.family(f)
             if fam:
-                hits &= self.family_tests(fam)
-            out |= hits
+                users = self.family_tests(fam)
+                if self.refcount(leaf) > GENERIC_REFS:
+                    out |= users
+                    continue
+                hits = self.referring_cached(leaf) & users
+                if leaf.endswith("_sql"):
+                    hits |= self.expr_instances(leaf[: -len("_sql")]) & users
+                out |= hits if hits else users
+                continue
+            broad = classes and (self.refcount(leaf) > GENERIC_REFS or len(self.referring_cached(leaf)) > BROAD_TESTS)
+            refs = {classes[-1], classes[-1].lower() + "_sql"} if broad else {leaf}
+            out |= self.referring(refs)
+            if leaf.endswith("_sql"):
+                out |= self.expr_instances(leaf[: -len("_sql")])
+        return out
+
+    def expr_instances(self, key):
+        """Tests that created an expression whose class name is `key` (any case)."""
+        out = set()
+        for ck in self.maps.expr_classes:
+            if ck.rsplit(":", 1)[-1].rsplit(".", 1)[-1].lower() == key.lower():
+                out |= self.maps.instantiated(ck)
         return out
 
     def referring_cached(self, name):

@@ -35,7 +35,7 @@ def select(text, analyzer):
     """-> (tests or ALL, reason, per-file [(FileDiff, tests)], info) where info
     has the runtime part, the import-time-by-names part and an import-time flag."""
     diffs = patchlib.parse(text)
-    info = {"runtime": set(), "names": set(), "import_time": False}
+    info = {"runtime": set(), "names": set(), "import_time": False, "looked_up": {}, "whole_file": False}
     if not diffs:
         return set(), "empty-patch", [], info
     tests = set()
@@ -51,6 +51,9 @@ def select(text, analyzer):
         info["runtime"] |= analyzer.runtime_part
         info["names"] |= analyzer.names_part
         info["import_time"] |= analyzer.import_time
+        info["whole_file"] |= analyzer.whole_file
+        for f, ls in analyzer.looked_up.items():
+            info["looked_up"].setdefault(f, set()).update(ls)
     return tests, "; ".join(why), parts, info
 
 
@@ -238,6 +241,63 @@ def run_plans(commits, verifier, ms, cpu, verify_until):
         )
 
 
+def plan_jobs(commits, analyzer, verifier, ms):
+    """Expensive pool-based tests (test_execute_tpcds, ...) still selected:
+    run just the jobs that reach the changed lines; the others return None,
+    which these tests skip. A pass means the test cannot fail on this change.
+    -> [(commit, test, jobs)] worth running."""
+    maps = analyzer.maps
+    out = []
+    for c in commits:
+        if c.sel is ALL or c.patched is None or not c.info or c.info["whole_file"] or c.info["import_time"]:
+            continue
+        for h in sorted(c.sel):
+            if ms[h] < policy.HEAVY_MS or h in maps.unverifiable:
+                continue
+            r = maps.jobs_reaching(h, c.info["looked_up"])
+            if r is None or not r[1]:
+                continue
+            count, jobs = r
+            cls = verifier.class_of(h)
+            # measured: a small fixed part (class setup, parsing every job's input)
+            # plus each job at ~1.6x the test's average per-job CPU
+            run_ms = policy.FIXED_MS + policy.ALPHA * (
+                maps.class_setup_ms(cls) + maps.cpu_ms[h] * (0.01 + 1.6 * len(jobs) / count)
+            )
+            saved = pack(c.sel, ms)[0] - pack(c.sel - {h}, ms)[0]
+            # a failing job stops the run early: assume half the cost then
+            gain = policy.P_HEAVY_PASS * saved - run_ms * (policy.P_HEAVY_PASS + (1 - policy.P_HEAVY_PASS) / 2)
+            if gain > policy.MIN_GAIN_MS:
+                out.append((gain, c, h, jobs, count, run_ms))
+    # these tests need pandas/numpy/duckdb: worth importing only for enough gain
+    if out and not verifier.heavy_loaded and sum(g for g, *_ in out) < policy.HEAVY_IMPORT_MS:
+        return []
+    return [x[1:] for x in sorted(out, key=lambda x: -x[0])]
+
+
+def run_jobs(plans, verifier, ms, cpu, verify_until):
+    for c, h, jobs, count, run_ms in plans:
+        if h not in c.sel:
+            continue
+        left = verify_until - time.monotonic()
+        if left <= 1:
+            c.why += " | jobs: out of time"
+            continue
+        # CPU cap from the planned job count: a change can make a few jobs very
+        # slow, and running into the cap just keeps the test selected
+        limit = max(2.0, run_ms / 1000)
+        try:
+            cpu0 = verifier.cpu_children
+            passed, failed, _ = verifier.run(c.patched, [h], {h: limit}, min(left, 5 + limit), jobs={h: (jobs, count)})
+        except Exception as e:  # noqa: BLE001
+            c.why += f" | jobs error {e!r}"
+            continue
+        if h in passed:
+            c.sel = c.sel - {h}
+        c.why += (f" | ran {len(jobs)} jobs of {h}: {'passed' if h in passed else 'kept'},"
+                  f" cpu {verifier.cpu_children - cpu0:.2f}s")
+
+
 def main():
     start = time.monotonic()
     with open(os.path.join(DATA, "tests.json"), encoding="utf-8") as fh:
@@ -253,6 +313,12 @@ def main():
     except Exception as e:  # noqa: BLE001
         log("maps failed to load, running everything:", repr(e))
 
+    def phase(name):
+        kids = getattr(verifier, "cpu_children", 0.0) if verifier is not None else 0.0
+        log(f"phase {name}: {time.monotonic() - start:.2f}s wall, self {time.process_time():.2f}s, children {kids:.2f}s")
+
+    verifier = None
+    phase("loaded")
     # 1. static analysis of every commit
     if analyzer is not None:
         for c in commits:
@@ -267,6 +333,7 @@ def main():
             except Exception as e:  # noqa: BLE001
                 c.sel, c.why = ALL, f"error {e!r}"
 
+    phase("analysed")
     # 2. changes that run while sqlglot is imported: import it with the patch
     if analyzer is not None and IMPORT_CHECK:
         verifier = Verifier(tests_json["tests"])
@@ -275,6 +342,7 @@ def main():
         except Exception as e:  # noqa: BLE001
             log("import checks failed:", repr(e))
 
+    phase("import-checked")
     # 3. run-time verification where it is expected to pay
     if VERIFY and analyzer is not None:
         try:
@@ -284,9 +352,15 @@ def main():
             log(f"verification plans: heavy libs {'on' if heavy else 'off'} (gain est light {lg:.0f}ms, heavy {hg:.0f}ms)")
             verify_until = start + min(DEADLINE * 0.8, VERIFY_WALL_PER_COMMIT * len(commits))
             run_plans(commits, verifier, ms, analyzer.maps.cpu_ms, verify_until)
+            if policy.JOB_SUBSETS:
+                jp = plan_jobs(commits, analyzer, verifier, ms)
+                if jp:
+                    log(f"job-subset runs planned: {len(jp)}")
+                    run_jobs(jp, verifier, ms, analyzer.maps.cpu_ms, verify_until)
         except Exception as e:  # noqa: BLE001
             log("verification failed:", repr(e))
 
+    phase("verified")
     # 4. pack and print
     everything = None
     for c in commits:

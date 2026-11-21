@@ -20,6 +20,7 @@ class Maps:
         self.imports_top = m.get("imports_top", self.imports)
         self.uses = m.get("uses", {})
         self.expr_classes = m.get("expr_classes", {})
+        self._jobs = m.get("jobs")  # older single-file maps; else maps/jobs.json.gz on demand
         # measured in-process CPU (tools/measure_cpu.py), scaled to tests.json's machine
         self.class_setup = {}
         self.cpu_ms = {}
@@ -93,6 +94,31 @@ class Maps:
         defined in this module."""
         idx = self.uses.get(path)
         return set(self.set(idx)) if idx is not None else set()
+
+    def jobs_reaching(self, number, looked_up):
+        """For a test that submits work to a process pool: (job count, set of
+        jobs that ran any of the looked-up lines), or None when some of those
+        lines also ran outside its jobs (then the whole test is needed)."""
+        if self._jobs is None:
+            try:
+                with gzip.open(os.path.join(MAPS, "jobs.json.gz"), "rb") as fh:
+                    self._jobs = json.loads(fh.read())
+            except OSError:
+                self._jobs = {}
+        entry = self._jobs.get(self.tests[number]["id"]) if number < len(self.tests) else None
+        if not entry:
+            return None
+        mask = 0
+        for f, lines in looked_up.items():
+            main = set(entry["main"].get(f, ()))
+            if main & set(lines):
+                return None
+            fl = entry["lines"].get(f, {})
+            for ln in lines:
+                m = fl.get(str(ln))
+                if m:
+                    mask |= int(m, 16)
+        return entry["count"], {i for i in range(entry["count"]) if mask >> i & 1}
 
     def instantiated(self, cls_key: str) -> set:
         """Tests that created an expression of class "module:Qualname" or a subclass."""

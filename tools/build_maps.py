@@ -24,6 +24,10 @@ commit. Layout:
   opens      {path: set index} tests that open()ed the file
   lists      {dir: set index}  tests that listed the directory
   subprocess [set index]  tests that start subprocesses
+  (jobs.json.gz) {test: {count, lines: {file: {line: hex mask of jobs}}, main: {file:
+             [lines run outside jobs]}}} for tests that submit work to a
+             process pool (job i = i-th submission; a subTest entered after
+             reading job i's result counts as job i)
   expr_classes {"module:Class": set index}  tests that created an expression
              of that class or a subclass
   uses       {module file: set index}  tests that created a Dialect, Tokenizer,
@@ -82,9 +86,23 @@ def slots_of(ctx):
 ctx_slots = {cid: slots_of(c) for cid, c in contexts.items()}
 
 line_tests = defaultdict(lambda: defaultdict(set))
+# per pool-based test: which jobs ran each line, and the lines its main body ran
+job_lines = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+job_count = defaultdict(int)
+call_lines = defaultdict(lambda: defaultdict(set))
 preimport = defaultdict(set)
 for fid, cid, bits in db.execute("select file_id, context_id, numbits from line_bits"):
     f = rel(files[fid])
+    ctx = contexts[cid]
+    if "|job" in ctx:
+        nodeid, job = ctx.rsplit("|job", 1)
+        if job.isdigit():
+            j = int(job)
+            job_count[nodeid] = max(job_count[nodeid], j + 1)
+            for ln in numbits_to_nums(bits):
+                job_lines[nodeid][f][ln] |= 1 << j
+    elif ctx.endswith("|call"):
+        call_lines[ctx[: -len("|call")]][f].update(numbits_to_nums(bits))
     s = ctx_slots[cid]
     for ln in numbits_to_nums(bits):
         if s is None:
@@ -192,6 +210,15 @@ out = {
     "uses": {f: intern(s) for f, s in sorted(uses.items())},
     "expr_classes": {c: intern(s) for c, s in sorted(exprs.items())},
 }
+# per-job coverage of pool-based tests: a separate file, loaded only when needed
+jobs = {
+    t: {
+        "count": job_count[t],
+        "lines": {f: {str(ln): format(m, "x") for ln, m in sorted(lm.items())} for f, lm in sorted(fl.items())},
+        "main": {f: sorted(ls) for f, ls in sorted(call_lines[t].items())},
+    }
+    for t, fl in sorted(job_lines.items())
+}
 
 
 out["sets"] = sets
@@ -268,6 +295,8 @@ os.makedirs(maps_dir, exist_ok=True)
 data = json.dumps(out, separators=(",", ":")).encode()
 with open(os.path.join(maps_dir, "coverage.json.gz"), "wb") as fh:
     fh.write(gzip.compress(data, compresslevel=9, mtime=0))
+with open(os.path.join(maps_dir, "jobs.json.gz"), "wb") as fh:
+    fh.write(gzip.compress(json.dumps(jobs, separators=(",", ":")).encode(), compresslevel=9, mtime=0))
 print(
     f"{len(tests)} tests, {len(sets)} sets, {sum(len(v) for v in out['lines'].values())} lines in"
     f" {len(out['lines'])} files, {len(opens)} opened paths, {len(lists)} listed dirs,"

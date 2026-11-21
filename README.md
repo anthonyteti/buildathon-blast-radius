@@ -26,6 +26,10 @@ pinned commit (`maps/coverage.json.gz`, rebuilt with `tools/build_maps.sh`):
   their bases) each test created. Functions are dispatched by name (parser
   `FUNCTIONS` tables, `<key>_sql` generator methods), so a test can depend on a
   class without running a line that names it.
+- **process-pool jobs** of tests that submit work to a pool
+  (`maps/jobs.json.gz`): which lines each job ran (job i = i-th submission;
+  a subTest entered after reading job i's result counts as job i), and which
+  lines the test ran outside its jobs.
 - **static import graph** of `sqlglot/` and `tests/`.
 - **CPU cost of running each test in-process** (`maps/cpu.json`,
   `tools/measure_cpu.py`), scaled to the recorded seconds.
@@ -105,6 +109,17 @@ expensive candidates are left out; everything not run stays selected. This is
 weak-mutation evidence about the change itself, not a table of edits. It was
 enabled after showing no miss on 300+ self-generated, fully labelled changes.
 
+### Expensive pool-based tests: run only the jobs that reach the change
+
+`test_execute_tpcds` (21.5 s) runs 99 queries as process-pool jobs and skips
+comparing a job whose result is `None`. When every changed line it reached ran
+only inside some of its jobs, the verification child runs the test with just
+those jobs (the others return `None` at once). If it passes, the test cannot
+fail on this change and is left out. The run counts as a pass only if the test
+submitted exactly the number of jobs recorded in the map, and it is capped at
+its estimated CPU; anything else keeps the test selected. It is used only when
+the expected saving beats the measured cost (`BR_JOB_SUBSETS=0` turns it off).
+
 Selected tests are packed (`app/pack.py`) to minimise
 `max worker load + 2 s x workers` over 1..8 workers: exact search for small
 selections, otherwise longest-first plus a move/swap local search. Everything
@@ -121,6 +136,7 @@ table from patches or kinds of edit to failing tests.
   (`policy.py`), packing (`pack.py`).
 - `maps/coverage.json.gz`: the maps (test sets stored as hex bitmasks over the map's test list).
 - `maps/cpu.json`: in-process CPU per test and per `setUpClass`.
+- `maps/jobs.json.gz`: per-job coverage of pool-based tests (loaded on demand).
 - `tools/`: how the maps are built (`build_maps.sh` runs `run_coverage.sh` twice
   with `covplugin.py` inside the submission image, then `build_maps.py`;
   `measure_cpu.py` writes `maps/cpu.json`), and

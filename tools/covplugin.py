@@ -77,10 +77,12 @@ subprocess.Popen.__init__ = _popen_init
 
 
 def pytest_runtest_setup(item):
+    _jobs["n"] = 0  # job numbers count from the start of each test, setUp included
     _switch(item.nodeid + "|setup")
 
 
 def pytest_runtest_call(item):
+    _jobs["current"] = None
     _switch(item.nodeid + "|call")
 
 
@@ -102,18 +104,41 @@ import concurrent.futures as _cf
 import pickle as _pickle
 
 
+# Each job submitted to a pool gets its own coverage context "<test>|job<i>"
+# (i = submission order within the test), and so does work done in a subTest
+# entered after reading job i's result. That lets the selector run only the
+# jobs of a pool-based test (e.g. one query of test_execute_tpcds) that reach
+# a changed line.
+_jobs = {"n": 0, "current": None}
+
+
+class _JobFuture(_cf.Future):
+    def result(self, timeout=None):
+        _jobs["current"] = self._br_index
+        return super().result(timeout)
+
+
 class InlineExecutor:
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
         if initializer is not None:
             initializer(*_pickle.loads(_pickle.dumps(initargs)))
 
     def submit(self, fn, *args, **kwargs):
-        fut = _cf.Future()
+        fut = _JobFuture()
+        fut._br_index = i = _jobs["n"]
+        _jobs["n"] += 1
+        base = _current["ctx"]
+        job_ctx = base.endswith("|call")
+        if job_ctx:
+            _switch(base[: -len("|call")] + f"|job{i}")
         try:
             a, k = _pickle.loads(_pickle.dumps((args, kwargs)))
             fut.set_result(_pickle.loads(_pickle.dumps(fn(*a, **k))))
         except BaseException as e:  # noqa: BLE001
             fut.set_exception(e)
+        finally:
+            if job_ctx:
+                _switch(base)
         return fut
 
     def map(self, fn, *its, **kw):
@@ -133,6 +158,30 @@ _cf.ProcessPoolExecutor = InlineExecutor
 import concurrent.futures.process as _cfp  # noqa: E402
 
 _cfp.ProcessPoolExecutor = InlineExecutor
+
+import contextlib  # noqa: E402
+import unittest  # noqa: E402
+
+_orig_subtest = unittest.TestCase.subTest
+
+
+@contextlib.contextmanager
+def _subtest(self, *args, **params):
+    i = _jobs["current"]
+    base = _current["ctx"]
+    if i is not None and base.endswith("|call"):
+        _switch(base[: -len("|call")] + f"|job{i}")
+        try:
+            with _orig_subtest(self, *args, **params):
+                yield
+        finally:
+            _switch(base)
+    else:
+        with _orig_subtest(self, *args, **params):
+            yield
+
+
+unittest.TestCase.subTest = _subtest
 
 # Import every sqlglot module up front so module and class bodies are recorded
 # under "preimport" instead of being charged to whichever test loads a dialect

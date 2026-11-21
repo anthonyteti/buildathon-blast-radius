@@ -13,9 +13,9 @@ from .pack import pack
 # CPU ms to fork a child and import sqlglot plus the test modules.
 FIXED_MS = int(os.environ.get("BR_FIXED_MS", "250"))
 # CPU ms the first time pandas/numpy/duckdb are needed in a run.
-HEAVY_IMPORT_MS = int(os.environ.get("BR_HEAVY_IMPORT_MS", "2200"))
+HEAVY_IMPORT_MS = int(os.environ.get("BR_HEAVY_IMPORT_MS", "3300"))
 # Multiplier on each test's measured in-process CPU (maps/cpu.json).
-ALPHA = float(os.environ.get("BR_ALPHA", "1.4"))
+ALPHA = float(os.environ.get("BR_ALPHA", "1.8"))
 # Prior that a commit breaks none of its candidates, by what changed.
 P_NONE_CODE = float(os.environ.get("BR_P_NONE_CODE", "0.5"))
 P_NONE_DATA = float(os.environ.get("BR_P_NONE_DATA", "0.1"))
@@ -95,3 +95,9 @@ def plan_skip(cands, ms, cpu, verifiable, p_none, setup_ms):
     if gain < MIN_GAIN_MS:
         return 0.0, []
     return gain, v
+
+
+# ---- expensive pool-based tests: run only the jobs reaching the change ----
+JOB_SUBSETS = os.environ.get("BR_JOB_SUBSETS", "1") == "1"
+# Prior that a selected expensive test passes.
+P_HEAVY_PASS = float(os.environ.get("BR_P_HEAVY_PASS", "0.6"))

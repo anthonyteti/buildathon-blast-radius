@@ -70,11 +70,15 @@ class Verifier:
                 return True
         return False
 
-    def run(self, patched, nums, per_test, budget, probe=False):
+    def run(self, patched, nums, per_test, budget, probe=False, jobs=None):
         """patched: {relative path: new text}; nums: tests to run, in order.
         per_test: {num: CPU seconds allowed}. budget: wall seconds for all.
         Stops at the first test that does not pass.
         With probe=True, patched modules carry infection probes (app/probe.py).
+        jobs={test: (job indices, job count)}: in that test, process-pool jobs
+        outside the set return None without running (numbering as in
+        tools/covplugin.py); the test only counts as passed if it submitted
+        exactly the recorded number of jobs.
         Returns (passed numbers, first non-passing number or None,
         (probe executions, infected executions) or None)."""
         # keep each class's tests together: unittest re-runs setUpClass (1.5 s
@@ -103,7 +107,8 @@ class Verifier:
             code = 0
             try:
                 os.dup2(2, 1)  # nothing a test prints may reach our stdout
-                _child(patched, [(n, self.tests[n]["id"], per_test[n]) for n in nums], w, probe)
+                _child(patched, [(n, self.tests[n]["id"], per_test[n]) for n in nums], w, probe,
+                       {self.tests[n]["id"]: (set(js), cnt) for n, (js, cnt) in (jobs or {}).items()})
             except BaseException:  # noqa: BLE001
                 code = 1
             finally:
@@ -274,6 +279,12 @@ def _install(patched, probe=False):
 
         def submit(self, fn, *args, **kwargs):
             fut = cf.Future()
+            i = _job_state["n"]
+            _job_state["n"] += 1
+            only = _job_state["only"].get(_job_state["test"])
+            if only is not None and i not in only[0]:
+                fut.set_result(None)  # job does not reach the change
+                return fut
             try:
                 a, k = pickle.loads(pickle.dumps((args, kwargs)))
                 fut.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
@@ -318,9 +329,13 @@ def _state_child(patched, wfd, only=None):
     out.flush()
 
 
-def _child(patched, plan, wfd, probe=False):
+_job_state = {"test": None, "n": 0, "only": {}}
+
+
+def _child(patched, plan, wfd, probe=False, jobs=None):
     out = os.fdopen(wfd, "w", buffering=1)
     recorder = _install(patched, probe)
+    _job_state["only"] = jobs or {}
 
     import unittest
 
@@ -349,6 +364,12 @@ def _child(patched, plan, wfd, probe=False):
     class Result(unittest.TestResult):
         def startTest(self, test):
             super().startTest(test)
+            _job_state["n"] = 0
+            _job_state["test"] = None
+            for tid in _job_state["only"]:
+                path, cls, meth = tid.split("::")
+                if test.id() == path[:-3].replace("/", ".") + "." + cls + "." + meth:
+                    _job_state["test"] = tid
             self._bad = False
             _, limit = by_id.get(test.id(), (None, 2.0))
             signal.setitimer(signal.ITIMER_PROF, limit)
@@ -383,6 +404,9 @@ def _child(patched, plan, wfd, probe=False):
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_PROF, 0)
             super().stopTest(test)
+            tid = _job_state["test"]
+            if tid is not None and _job_state["n"] != _job_state["only"][tid][1]:
+                self._bad = True  # job numbering does not match the map
             if probe and recorder.infected + recorder.unprobed:
                 self.shouldStop = True  # the expensive-test rule can no longer apply
             if test.id() in by_id:
