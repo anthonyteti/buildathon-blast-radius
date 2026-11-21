@@ -11,11 +11,11 @@ import os
 from .pack import pack
 
 # CPU ms to fork a child and import sqlglot plus the test modules.
-FIXED_MS = int(os.environ.get("BR_FIXED_MS", "200"))
+FIXED_MS = int(os.environ.get("BR_FIXED_MS", "250"))
 # CPU ms the first time pandas/numpy/duckdb are needed in a run.
-HEAVY_IMPORT_MS = int(os.environ.get("BR_HEAVY_IMPORT_MS", "1500"))
+HEAVY_IMPORT_MS = int(os.environ.get("BR_HEAVY_IMPORT_MS", "2200"))
 # Multiplier on each test's measured in-process CPU (maps/cpu.json).
-ALPHA = float(os.environ.get("BR_ALPHA", "1.0"))
+ALPHA = float(os.environ.get("BR_ALPHA", "1.4"))
 # Prior that a commit breaks none of its candidates, by what changed.
 P_NONE_CODE = float(os.environ.get("BR_P_NONE_CODE", "0.5"))
 P_NONE_DATA = float(os.environ.get("BR_P_NONE_DATA", "0.1"))

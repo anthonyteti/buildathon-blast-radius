@@ -38,22 +38,20 @@ class Verifier:
         return _state_parent(self, patched, budget, only)
 
     def baseline_state(self):
-        """Unpatched fingerprint, computed in a child exactly like the patched
-        ones. Attributes known to vary between processes (measured at image
-        build time into maps/baseline_state.json) are marked unstable."""
+        """Unpatched import status and fingerprint, made at image build time
+        (maps/baseline_state.json, app/state.py); computed here in a child if
+        that file is missing."""
         if getattr(self, "_baseline", None) is None:
-            a = self.import_state({})
-            unstable = set()
             self.eager = None  # unknown: treat every module as eager
             path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps", "baseline_state.json")
             try:
                 with open(path) as fh:
                     b = json.load(fh)
-                unstable = set(b["unstable"])
                 self.eager = set(b["eager"])
+                self._baseline = ["ok", b["status"], b["fingerprint"], set(b["unstable"])]
             except (OSError, ValueError, KeyError):
-                pass
-            self._baseline = a + [unstable] if a[0] == "ok" else a
+                a = self.import_state({})
+                self._baseline = a + [set()] if a[0] == "ok" else a
         return self._baseline
 
     def class_of(self, n):

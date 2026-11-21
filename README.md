@@ -47,8 +47,10 @@ cannot tell which tests read what they build. For such a change the selector
 imports all of sqlglot with the patch applied, in a forked child, and compares
 a structural fingerprint of every module- and class-level attribute with the
 unpatched one (sets and dicts sorted, classes and functions named, closures
-and defaults included; the few attributes that vary between processes are
-measured when the image is built and ignored):
+and defaults included). The unpatched fingerprint is made when the image is
+built (`maps/baseline_state.json`, from three runs: the few attributes that
+vary between processes are ignored). Only the patched modules and the modules
+whose import runs them are imported and compared:
 
 - a module that imported before now fails to import: every test;
 - no attribute changed: nothing beyond the coverage of the changed lines;

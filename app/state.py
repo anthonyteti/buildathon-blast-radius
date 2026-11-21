@@ -165,9 +165,9 @@ def diff(a, b, modules=None):
 
 
 def build_baseline(out_path, runs=3):
-    """Run at image build time: the paths whose digest varies between processes
-    (address-ordered data), which are ignored, and the modules a plain
-    `import sqlglot` loads."""
+    """Run at image build time: the unpatched import status and fingerprint,
+    the paths whose digest varies between processes (address-ordered data,
+    ignored), and the modules a plain `import sqlglot` loads."""
     import json
     import subprocess
 
@@ -185,7 +185,7 @@ def build_baseline(out_path, runs=3):
         [sys.executable, "-c", "import json, sys, sqlglot; print(json.dumps(sorted(m for m in sys.modules if m.startswith('sqlglot'))))"],
         capture_output=True, text=True, check=True).stdout)
     with open(out_path, "w") as fh:
-        json.dump({"attributes": len(fp), "unstable": sorted(unstable), "eager": eager}, fh)
+        json.dump({"status": status, "fingerprint": fp, "unstable": sorted(unstable), "eager": eager}, fh)
     print(f"baseline: {len(fp)} attributes, {len(unstable)} unstable", file=sys.stderr)
 
 
