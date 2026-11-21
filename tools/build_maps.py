@@ -1,6 +1,11 @@
 """Compact the coverage run (tools/run_coverage.sh) into maps/coverage.json.gz.
 
-usage: build_maps.py <cov_dir> <sqlglot_checkout> <maps_dir>
+usage: build_maps.py <cov_dir>[,<lazy_cov_dir>] <sqlglot_checkout> <maps_dir>
+
+The optional second coverage run is made without pre-importing sqlglot, the
+way the real suite runs: from it only lines run inside a test are added, which
+shows the lazy-loading paths (a dialect imported on first use) that the first
+run hides.
 
 Everything in the map comes from running sqlglot's own suite at the pinned
 commit. Layout:
@@ -15,6 +20,9 @@ commit. Layout:
              class bodies); the selector handles those by name references.
   opens      {path: set index} tests that open()ed the file
   lists      {dir: set index}  tests that listed the directory
+  subprocess [set index]  tests that start subprocesses
+  uses       {module file: set index}  tests that created a Dialect, Tokenizer,
+             Parser or Generator instance of a class defined in that module
 """
 
 import ast
@@ -28,7 +36,8 @@ from collections import defaultdict
 
 from coverage.numbits import numbits_to_nums
 
-cov_dir, src, maps_dir = sys.argv[1:4]
+cov_arg, src, maps_dir = sys.argv[1:4]
+cov_dir, lazy_dir = (cov_arg.split(",") + [None])[:2]
 
 db = sqlite3.connect(os.path.join(cov_dir, ".coverage"))
 files = dict(db.execute("select id, path from file"))
@@ -78,9 +87,51 @@ for fid, cid, bits in db.execute("select file_id, context_id, numbits from line_
         else:
             line_tests[f][ln] |= s
 
+def function_lines(path):
+    """Lines inside function or lambda bodies (not module/class-level code)."""
+    try:
+        tree = ast.parse(open(os.path.join(src, path)).read())
+    except (OSError, SyntaxError, ValueError):
+        return set()
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.update(range(node.body[0].lineno, node.end_lineno + 1))
+        elif isinstance(node, ast.Lambda):
+            out.update(range(node.body.lineno, node.end_lineno + 1))
+    return out
+
+
+_fn_lines = {}
+lazy_added = 0
+if lazy_dir:
+    db2 = sqlite3.connect(os.path.join(lazy_dir, ".coverage"))
+    files2 = dict(db2.execute("select id, path from file"))
+    contexts2 = dict(db2.execute("select id, context from context"))
+    for fid, cid, bits in db2.execute("select file_id, context_id, numbits from line_bits"):
+        ctx = contexts2[cid]
+        if not ctx.endswith(("|setup", "|call", "|teardown")):
+            continue
+        s = slots_of(ctx)
+        if not s:
+            continue
+        f = rel(files2[fid])
+        if f not in _fn_lines:
+            _fn_lines[f] = function_lines(f)
+        for ln in numbits_to_nums(bits):
+            if ln not in _fn_lines[f]:
+                continue  # import-time code: charged to whichever test loaded the module first
+            if not s <= line_tests[f][ln]:
+                lazy_added += 1
+                line_tests[f][ln] |= s
+
 opens = defaultdict(set)
 lists = defaultdict(set)
-for p in glob.glob(os.path.join(cov_dir, "opens.*.jsonl")):
+spawners = set()
+uses = defaultdict(set)
+for p in glob.glob(os.path.join(cov_dir, "opens.*.jsonl")) + (
+    glob.glob(os.path.join(lazy_dir, "opens.*.jsonl")) if lazy_dir else []
+):
     for row in open(p):
         ctx, kind, path = json.loads(row)
         if "__pycache__" in path:
@@ -89,6 +140,15 @@ for p in glob.glob(os.path.join(cov_dir, "opens.*.jsonl")):
             continue  # pytest itself collecting / rewriting the test module
         s = slots_of(ctx)
         if not s:
+            continue
+        if kind == "subprocess":
+            spawners |= s
+            continue
+        if kind == "use":
+            f = path.replace(".", "/") + ".py"
+            if not os.path.exists(os.path.join(src, f)):
+                f = path.replace(".", "/") + "/__init__.py"
+            uses[f] |= s
             continue
         (opens if kind == "open" else lists)[path] |= s
 
@@ -116,7 +176,11 @@ out = {
     "opens": {p: intern(s) for p, s in sorted(opens.items())},
     "lists": {p: intern(s) for p, s in sorted(lists.items())},
     "preimport": {f: sorted(ls) for f, ls in sorted(preimport.items())},
+    "subprocess": [intern(spawners)] if spawners else [],
+    "uses": {f: intern(s) for f, s in sorted(uses.items())},
 }
+
+
 out["sets"] = sets
 
 
@@ -169,6 +233,6 @@ with open(os.path.join(maps_dir, "coverage.json.gz"), "wb") as fh:
 print(
     f"{len(tests)} tests, {len(sets)} sets, {sum(len(v) for v in out['lines'].values())} lines in"
     f" {len(out['lines'])} files, {len(opens)} opened paths, {len(lists)} listed dirs,"
-    f" {len(data) // 1024} KB raw",
+    f" {len(data) // 1024} KB raw; {lazy_added} line attributions from the lazy run; {len(spawners)} subprocess tests",
     file=sys.stderr,
 )

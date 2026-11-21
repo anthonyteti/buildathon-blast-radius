@@ -21,6 +21,7 @@ _orig_open = builtins.open
 
 def _switch(ctx):
     _current["ctx"] = ctx
+    os.environ["COVMAP_CTX"] = ctx  # subprocesses record under the same context
     cov = coverage.Coverage.current()
     if cov is not None:
         cov.switch_context(ctx)
@@ -61,6 +62,18 @@ def _scandir(path="."):
 
 os.listdir = _listdir
 os.scandir = _scandir
+
+import subprocess  # noqa: E402
+
+_orig_popen_init = subprocess.Popen.__init__
+
+
+def _popen_init(self, args, *a, **k):
+    _reads.add((_current["ctx"], "subprocess", json.dumps(args if isinstance(args, (list, str)) else str(args))))
+    return _orig_popen_init(self, args, *a, **k)
+
+
+subprocess.Popen.__init__ = _popen_init
 
 
 def pytest_runtest_setup(item):
@@ -122,16 +135,46 @@ import concurrent.futures.process as _cfp  # noqa: E402
 _cfp.ProcessPoolExecutor = InlineExecutor
 
 # Import every sqlglot module up front so module and class bodies are recorded
-# under "preimport" instead of being charged to whichever test loads a dialect first.
-import importlib  # noqa: E402
-import pkgutil  # noqa: E402
+# under "preimport" instead of being charged to whichever test loads a dialect
+# first. A second pass runs with COVMAP_PREIMPORT=0 to see lazy loading as the
+# real suite does.
+if os.environ.get("COVMAP_PREIMPORT", "1") == "1":
+    import importlib  # noqa: E402
+    import pkgutil  # noqa: E402
 
-import sqlglot  # noqa: E402
+    import sqlglot  # noqa: E402
 
-for _m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+    for _m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+        try:
+            importlib.import_module(_m.name)
+        except Exception:
+            pass
+
+# Which tests use which dialect: record the module of every Dialect, Tokenizer,
+# Parser and Generator instance created (subclasses call these __init__s).
+import importlib as _il  # noqa: E402
+
+
+def _record_use(base_mod, base_name):
     try:
-        importlib.import_module(_m.name)
+        cls = getattr(_il.import_module(base_mod), base_name)
     except Exception:
-        pass
+        return
+    orig = cls.__init__
+
+    def __init__(self, *a, **k):
+        _reads.add((_current["ctx"], "use", type(self).__module__))
+        return orig(self, *a, **k)
+
+    cls.__init__ = __init__
+
+
+for _mod, _name in (
+    ("sqlglot.dialects.dialect", "Dialect"),
+    ("sqlglot.tokens", "Tokenizer"),
+    ("sqlglot.parser", "Parser"),
+    ("sqlglot.generator", "Generator"),
+):
+    _record_use(_mod, _name)
 
 _switch("collect|" + os.environ.get("COVMAP_FILE", "?"))

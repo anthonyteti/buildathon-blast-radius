@@ -16,6 +16,8 @@ RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests; chmod -R a+
 COPY maps /app/maps
 COPY app /app/app
 COPY selector.py /app/selector.py
+# Fingerprint of sqlglot's import-time state, unpatched (see app/state.py).
+RUN cd /app && PYTHONPATH=/opt/sqlglot:/app SKIP_INTEGRATION=0 python -m app.state /app/maps/baseline_state.json
 RUN python -m compileall -q /app && chmod -R a+rX /app
 ENV PYTHONDONTWRITEBYTECODE=1 SQLGLOT_SRC=/opt/sqlglot SKIP_INTEGRATION=0
 CMD ["python", "/app/selector.py"]

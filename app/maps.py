@@ -17,6 +17,18 @@ class Maps:
         self.lists = m["lists"]
         self.preimport = m["preimport"]
         self.imports = m.get("imports", {})
+        self.uses = m.get("uses", {})
+        # measured in-process CPU (tools/measure_cpu.py), scaled to tests.json's machine
+        self.class_setup = {}
+        self.cpu_ms = {}
+        cpu_path = os.path.join(MAPS, "cpu.json")
+        if os.path.exists(cpu_path):
+            with open(cpu_path) as fh:
+                c = json.load(fh)
+            self.class_setup = c.get("class_setup_ms", {})
+            self._cpu_by_id = c.get("test_ms", {})
+        else:
+            self._cpu_by_id = {}
         self._sets = m["sets"]
         self._cache = {}
         self.tests = tests_json["tests"]
@@ -26,9 +38,26 @@ class Maps:
         # slot (index in the map's test list) -> number in this run's tests.json
         self.slot_number = [number.get(t) for t in m["tests"]]
         self.mapped = {n for n in self.slot_number if n is not None}
+        # tests whose outcome an in-process run cannot reproduce: they start
+        # subprocesses (which would see the unpatched tree) or read sources as text
+        self.unverifiable = set()
+        self.subprocess_tests = set()
+        for idx in m.get("subprocess", []):
+            self.subprocess_tests |= self.set(idx)
+        self.unverifiable |= self.subprocess_tests
+        for p, idx in self.opens.items():
+            if p.endswith(".py"):
+                self.unverifiable |= self.set(idx)
+        for t in self.tests:
+            # never assume a test is cheaper to run here than recorded
+            self.cpu_ms[t["number"]] = max(self.ms[t["number"]], self._cpu_by_id.get(t["id"], 0))
         self.by_file = {}
         for t in self.tests:
             self.by_file.setdefault(t["file"], set()).add(t["number"])
+
+    def class_setup_ms(self, cls):
+        """Measured CPU ms of a test class's setUpClass (0 if negligible)."""
+        return self.class_setup.get(cls, 0)
 
     def set(self, idx) -> frozenset:
         s = self._cache.get(idx)
@@ -56,6 +85,12 @@ class Maps:
         for idx in set((self.lines.get(path) or {}).values()):
             out |= self.set(idx)
         return out
+
+    def used_by(self, path: str) -> set:
+        """Tests that created a Dialect/Tokenizer/Parser/Generator from a class
+        defined in this module."""
+        idx = self.uses.get(path)
+        return set(self.set(idx)) if idx is not None else set()
 
     def opened(self, path: str) -> set:
         idx = self.opens.get(path)

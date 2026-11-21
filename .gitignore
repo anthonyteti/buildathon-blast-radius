@@ -1,3 +1,4 @@
 .mapwork/
 __pycache__/
 *.pyc
+maps/baseline_state.json
