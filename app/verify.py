@@ -81,7 +81,9 @@ class Verifier:
         jobs={test: (job indices, job count)}: in that test, process-pool jobs
         outside the set return None without running (numbering as in
         tools/covplugin.py); with a third item "memo", they return their
-        recorded result when that is exact (app/memo.py) and run otherwise.
+        recorded result when that is exact (app/memo.py) and run otherwise,
+        and jobs in an optional fourth set end at optimize() when the
+        optimized tree is as recorded.
         The test only counts as passed if it submitted exactly the recorded
         number of jobs.
         Returns (passed numbers, first non-passing number or None,
@@ -310,28 +312,45 @@ def _install(patched, probe=False):
             _job_state["n"] += 1
             tid = _job_state["test"]
             only = _job_state["only"].get(tid)
-            if only is not None and i not in only[0]:
-                if len(only) < 3 or only[2] != "memo":
-                    fut.set_result(None)  # job does not reach the change
-                    return fut
-                # memo mode: a job that does not reach the change, with the
-                # recorded pool initializer and arguments, returns its
-                # recorded result (app/memo.py); otherwise it runs
+            memo_mode = only is not None and len(only) > 2 and only[2] == "memo"
+            expect = None
+            if only is not None and i not in only[0] and not memo_mode:
+                fut.set_result(None)  # job does not reach the change
+                return fut
+            if memo_mode:
+                # a job with the recorded pool initializer and arguments that
+                # does not reach the change returns its recorded result; one
+                # whose changed lines all ran inside optimize() in the
+                # recording runs up to there and returns its recorded result
+                # if the optimized tree is as recorded (app/memo.py);
+                # otherwise it runs
                 m = memolib.load() or {}
                 rec = m.get("jobs", {}).get(tid) or []
-                if (i < len(rec) and rec[i] is not None and m.get("inits", {}).get(tid) == self._init_key
-                        and rec[i][0] == memolib.args_key(args, kwargs)):
+                same_input = (i < len(rec) and rec[i] is not None and m.get("inits", {}).get(tid) == self._init_key
+                              and rec[i][0] == memolib.args_key(args, kwargs))
+                if same_input and i not in only[0]:
                     _job_state["replayed"] += 1
                     fut.set_result(pickle.loads(rec[i][1]))
                     return fut
+                if same_input and len(only) > 3 and i in only[3] and rec[i][3] is not None:
+                    expect = (rec[i][3], rec[i][1])
             blob = pickle.dumps((args, kwargs))
 
             def run(f):
+                _opt_state["expect"] = expect[0] if expect else None
                 try:
                     a, k = pickle.loads(blob)
                     f.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+                except memolib.OptimizedAsRecorded:
+                    _job_state["replayed"] += 1
+                    f.set_result(pickle.loads(expect[1]))
                 except BaseException as e:  # noqa: BLE001
                     f.set_exception(e)
+                finally:
+                    _opt_state["expect"] = None
+
+            if expect is not None:
+                _arm_optimize()
 
             if only is not None and len(only) > 2 and only[2] == "memo":
                 # the job runs when its result is first asked for, so a test
@@ -385,6 +404,25 @@ def _state_child(patched, wfd, only=None):
 
 
 _job_state = {"test": None, "n": 0, "only": {}, "replayed": 0}
+_opt_state = {"expect": None, "armed": False}
+
+
+def _arm_optimize():
+    """sqlglot.executor.execute's optimize(): while a job expects a recorded
+    tree, a matching tree ends the job (app/memo.py)."""
+    if _opt_state["armed"]:
+        return
+    from . import memo as memolib
+
+    def on_return(tree):
+        exp = _opt_state["expect"]
+        if exp is not None:
+            _opt_state["expect"] = None  # only the job's first optimize() call
+            if memolib.tree_digest(tree) == exp:
+                raise memolib.OptimizedAsRecorded()
+
+    memolib.wrap_optimize(on_return)
+    _opt_state["armed"] = True
 
 
 def _child(patched, plan, wfd, probe=False, jobs=None):

@@ -139,7 +139,11 @@ runs the executor tests unpatched and records (`maps/memo.pkl`, `app/memo.py`):
   statement run on that connection before it (the views over the data files)
   and the query text;
 - each pool job's pickled arguments (digest), pickled result and CPU, and
-  the digest of the pool initializer's pickled arguments.
+  the digest of the pool initializer's pickled arguments;
+- per job, a digest of the tree `optimize()` returned inside
+  `sqlglot.executor.execute` (every node's class and slots, back-pointers,
+  shared nodes) and the lines of the checkout the job ran outside that call
+  (`sys.monitoring`), plus the files jobs open (none).
 
 For a still-selected expensive test with a recording, the verification child
 runs the whole test with the patch applied, except that
@@ -149,13 +153,22 @@ runs the whole test with the patch applied, except that
 - a job that ran none of the changed lines in the per-job coverage
   (`maps/jobs.json.gz`, not used for changes that run at import time or in
   test files), whose arguments and pool initializer arguments pickle to the
-  recorded bytes, returns its recorded result: same code, same input.
+  recorded bytes, returns its recorded result: same code, same input. When
+  only data files no job opens changed (a fixture the test reads), every job
+  runs recorded code, so this holds for all of them;
+- a job whose changed lines all ran inside `optimize()` in the recording,
+  with the recorded input and a single `optimize()` call, runs up to the end
+  of `optimize()` on the patched code; if the tree has the recorded digest,
+  the rest of the job (planning, executing on the tables, generating SQL for
+  the log) is unchanged code on the same input, so it returns the recorded
+  result, otherwise it runs on.
 
 Everything else, including every sqlglot call in the test process (parsing,
 transpiling, unpickling and comparing results), runs for real on the patched
 code, and jobs run when the test asks for their result, so a failing test
-stops early. A pass means the test passes on this change; the test is then
-left out. Without a recording, pool-based tests whose changed lines ran only
+stops early. Other selected tests of the same class with a recording run
+in the same child, sharing its setup. A pass means the test passes on this
+change; the test is then left out. Without a recording, pool-based tests whose changed lines ran only
 inside jobs run just those jobs (the others return `None`, which these tests
 skip). It is used only when the expected saving beats the estimated CPU
 (`BR_JOB_SUBSETS=0` / `BR_MEMO=0` turn it off).

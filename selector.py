@@ -252,22 +252,43 @@ def run_plans(commits, verifier, ms, cpu, verify_until):
         )
 
 
-def _memo_plan(rec, mc, maps, verifier, c, h, tid, cls, exact_jobs):
-    """-> (jobs that must run, recorded job count, estimated CPU ms) for
-    running test h with the recording (app/memo.py)."""
+def _memo_plan(rec, mc, maps, c, h, tid, cls, exact_jobs):
+    """-> (jobs that reach the change, jobs among them that may end at
+    optimize(), recorded job count, estimated CPU ms) for running test h with
+    the recording (app/memo.py)."""
     recorded_jobs = (rec.get("jobs") or {}).get(tid) or []
     count = len(recorded_jobs)
-    r = maps.jobs_reaching(h, c.info["looked_up"], main_ok=True) if exact_jobs else None
+    opened = set((rec.get("job_opens") or {}).get(tid, ["?"]))
+    if not any(p.endswith(".py") or p in opened for p in c.patched) and "?" not in opened:
+        # only data files no job opens changed (fixtures the test reads):
+        # every job runs the recorded code on its arguments, so a job with
+        # the recorded input returns the recorded result
+        exact_jobs, c_looked_up = True, {}
+    else:
+        c_looked_up = c.info["looked_up"]
+    r = maps.jobs_reaching(h, c_looked_up, main_ok=True) if exact_jobs else None
     if count and (r is None or r[0] != count):
-        jobs = set(range(count))  # every job runs
-    else:
-        jobs = r[1] if r else set()
-    if any(r is None for j, r in enumerate(recorded_jobs) if j in jobs):
-        job_ms = mc["replay"] - mc["replay_all"]
-    else:
-        job_ms = sum(r[2] for j, r in enumerate(recorded_jobs) if r is not None and j in jobs)
+        return set(range(count)), set(), count, policy.FIXED_MS + policy.ALPHA * (
+            maps.class_setup_ms(cls) + mc["replay"])  # every job runs
+    jobs = r[1] if r else set()
+    # jobs whose changed lines all ran inside optimize() in the recording
+    outside = (rec.get("outside") or {}).get(tid) or {}
+    mask = 0
+    for f, lines in c_looked_up.items():
+        fl = outside.get(f, {})
+        for ln in lines:
+            mask |= fl.get(ln, 0)
+    opt_ok = {j for j in jobs if not mask >> j & 1 and recorded_jobs[j] is not None
+              and recorded_jobs[j][3] is not None and recorded_jobs[j][4] is not None}
+    job_ms = 0
+    for j in jobs:
+        r = recorded_jobs[j]
+        if r is None:
+            job_ms += (mc["replay"] - mc["replay_all"]) / max(count, 1)
+        else:
+            job_ms += r[4] if j in opt_ok else r[2]
     run_ms = policy.FIXED_MS + policy.ALPHA * (maps.class_setup_ms(cls) + mc["replay_all"] + job_ms)
-    return jobs, count, run_ms
+    return jobs, opt_ok, count, run_ms
 
 
 def plan_jobs(commits, analyzer, verifier, ms):
@@ -283,7 +304,10 @@ def plan_jobs(commits, analyzer, verifier, ms):
     means the test passes on this change.
     Without a recording: pool-based tests whose changed lines ran only inside
     jobs run just those jobs (the others return None, which they skip).
-    -> [(commit, test, jobs, job count, mode, estimated ms)] worth running."""
+    Other selected tests of the same class with a recording run in the same
+    child (one class setup), after the expensive one.
+    -> [(commit, test, other tests, jobs, job count, mode, estimated ms)]
+    worth running."""
     maps = analyzer.maps
     rec = memo.load() if MEMO else None
     rec_cpu = (rec or {}).get("cpu_ms", {})
@@ -292,19 +316,31 @@ def plan_jobs(commits, analyzer, verifier, ms):
         if c.sel is ALL or c.patched is None or not c.info:
             continue
         exact_jobs = not (c.info["whole_file"] or c.info["import_time"])
-        for h in sorted(c.sel):
-            if ms[h] < policy.HEAVY_MS or h in maps.unverifiable:
+        covered = set()
+        for h in sorted(c.sel, key=lambda t: (-ms[t], t)):
+            if ms[h] < policy.HEAVY_MS or h in maps.unverifiable or h in covered:
                 continue
+            extras = []
             tid = verifier.tests[h]["id"]
             cls = verifier.class_of(h)
             mc = rec_cpu.get(tid)
             if mc:
                 try:
-                    plan = _memo_plan(rec, mc, maps, verifier, c, h, tid, cls, exact_jobs)
+                    jobs, opt_ok, count, run_ms = _memo_plan(rec, mc, maps, c, h, tid, cls, exact_jobs)
                 except Exception:  # noqa: BLE001  (an unreadable recording: skip it)
                     continue
-                jobs, count, run_ms = plan
-                mode = "memo"
+                mode = ("memo", opt_ok)
+                # other selected tests of the class with a recording ride along:
+                # they share the class setup and replayed duckdb results
+                cand = sorted(t for t in c.sel - covered - {h}
+                              if verifier.class_of(t) == cls and t not in maps.unverifiable
+                              and rec_cpu.get(verifier.tests[t]["id"]) is not None)
+                if cand:
+                    extra_ms = policy.ALPHA * sum(rec_cpu[verifier.tests[t]["id"]]["replay"] for t in cand)
+                    rest = c.sel - {h}
+                    if pack(rest, ms)[0] - pack(rest - set(cand), ms)[0] > 2 * extra_ms:
+                        extras = cand
+                        run_ms += extra_ms
             else:
                 if not exact_jobs:
                     continue
@@ -317,12 +353,13 @@ def plan_jobs(commits, analyzer, verifier, ms):
                 run_ms = policy.FIXED_MS + policy.ALPHA * (
                     maps.class_setup_ms(cls) + maps.cpu_ms[h] * (0.01 + 1.6 * len(jobs) / count)
                 )
-                mode = "only"
-            saved = pack(c.sel, ms)[0] - pack(c.sel - {h}, ms)[0]
+                mode = ("only",)
+            saved = pack(c.sel, ms)[0] - pack(c.sel - {h} - set(extras), ms)[0]
             # a failing job stops the run early: assume half the cost then
             gain = policy.P_HEAVY_PASS * saved - run_ms * (policy.P_HEAVY_PASS + (1 - policy.P_HEAVY_PASS) / 2)
             if gain > policy.MIN_GAIN_MS:
-                out.append((gain, c, h, jobs, count, mode, run_ms))
+                out.append((gain, c, h, extras, jobs, count, mode, run_ms))
+                covered |= {h, *extras}
     # these tests need pandas/numpy/duckdb: worth importing only for enough gain
     if out and not verifier.heavy_loaded and sum(g for g, *_ in out) < policy.HEAVY_IMPORT_MS:
         return []
@@ -330,7 +367,8 @@ def plan_jobs(commits, analyzer, verifier, ms):
 
 
 def run_jobs(plans, verifier, ms, cpu, verify_until):
-    for c, h, jobs, count, mode, run_ms in plans:
+    rec_cpu = (memo.load() or {}).get("cpu_ms", {}) if MEMO else {}
+    for c, h, extras, jobs, count, mode, run_ms in plans:
         if h not in c.sel:
             continue
         left = verify_until - time.monotonic()
@@ -342,14 +380,20 @@ def run_jobs(plans, verifier, ms, cpu, verify_until):
         limit = max(2.0, 1.5 * run_ms / 1000)
         try:
             cpu0 = verifier.cpu_children
-            passed, failed, _ = verifier.run(c.patched, [h], {h: limit}, min(left, 5 + limit),
-                                             jobs={h: (jobs, count, mode)} if count or mode == "only" else None)
+            nums = [h] + [t for t in extras if t in c.sel]
+            per_test = {h: limit}
+            for t in nums[1:]:
+                per_test[t] = max(1.0, 3 * policy.ALPHA * rec_cpu[verifier.tests[t]["id"]]["replay"] / 1000 + 0.5)
+            passed, failed, _ = verifier.run(c.patched, nums, per_test, min(left, 5 + sum(per_test.values())),
+                                             jobs={h: (jobs, count, *mode)} if count or mode[0] == "only" else None)
         except Exception as e:  # noqa: BLE001
             c.why += f" | jobs error {e!r}"
             continue
-        if h in passed:
-            c.sel = c.sel - {h}
-        c.why += (f" | ran {len(jobs)}/{count} jobs of {h} ({mode}): {'passed' if h in passed else 'kept'},"
+        c.sel = c.sel - (passed & set(nums))
+        if len(nums) > 1:
+            c.why += f" | with {len(nums) - 1} more of its class: {len(passed & set(nums[1:]))} passed"
+        opt = f", {len(mode[1])} to optimize()" if len(mode) > 1 else ""
+        c.why += (f" | ran {len(jobs)}/{count} jobs of {h} ({mode[0]}{opt}): {'passed' if h in passed else 'kept'},"
                   f" cpu {verifier.cpu_children - cpu0:.2f}s")
 
 
