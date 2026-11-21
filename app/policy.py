@@ -55,8 +55,8 @@ def plan(cands, ms, cpu, verifiable, p_none, setup_ms):
     return gain, best[1]
 
 
-# ---- optional: skip expensive tests on evidence (off unless BR_SKIP_HEAVY=1) ----
-SKIP_HEAVY = os.environ.get("BR_SKIP_HEAVY", "0") == "1"
+# ---- skip expensive tests on evidence (on; BR_SKIP_HEAVY=0 turns it off) ----
+SKIP_HEAVY = os.environ.get("BR_SKIP_HEAVY", "1") == "1"
 # Tests at least this long are "expensive".
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "3000"))
 # CPU ms of cheaper candidates run (with probes) as evidence for the rule.

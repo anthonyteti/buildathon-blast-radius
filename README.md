@@ -85,17 +85,19 @@ error, skip, subtest failure, a timeout of 4x the recorded time, a crash)
 keeps the test selected. Tests that start subprocesses, or read source files
 as text, are never verified because an in-memory patch cannot reach them.
 
-### Expensive tests (off by default, `BR_SKIP_HEAVY=1`)
+### Expensive tests (on; `BR_SKIP_HEAVY=0` turns it off)
 
 Tests of 3 s or more (`test_max_nodes`, `test_execute_tpcds`, ...) dominate the
 cost. When a change only replaces side-effect-free expressions inside
-functions, the verification child can compile the patched module with
+functions, the verification child compiles the patched module with
 *infection probes* (`app/probe.py`): each replaced expression computes both its
 old and new value, returns the new one, and records whether they ever
-differed. If every cheaper candidate passes, the changed code ran at least
-once, and the old and new values never differed, the expensive candidates are
-left out. This is weak-mutation evidence about the change itself, not a table
-of edits.
+differed. The cheapest other candidates are run that way, within a CPU budget,
+stopping at the first difference. If they all pass, the changed expressions
+ran at least 20 times, and the old and new values never differed, the
+expensive candidates are left out; everything not run stays selected. This is
+weak-mutation evidence about the change itself, not a table of edits. It was
+enabled after showing no miss on 300+ self-generated, fully labelled changes.
 
 Selected tests are packed (`app/pack.py`) to minimise
 `max worker load + 2 s x workers` over 1..8 workers: exact search for small
