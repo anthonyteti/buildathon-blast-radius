@@ -46,25 +46,36 @@ state = {"test": None, "n": 0, "mode": "record"}
 job = {"in_opt": False, "lines": None, "digest": None, "t0": 0.0, "opt_ms": None, "opt_calls": 0}
 SRC_PREFIX = src + os.sep
 
-# lines of the checkout (sqlglot/, tests/) a job runs outside optimize():
-# sys.monitoring LINE events, each line
-# reported once per job (DISABLE, re-armed by restart_events at the next job);
-# lines inside optimize() are not reported and stay armed
+# lines of the checkout (sqlglot/, tests/) a job may run outside optimize():
+# every line of every code object (function, lambda, module body) that starts
+# or resumes outside optimize() during the job (sys.monitoring PY_START and
+# PY_RESUME). Whole code objects, not LINE events: a lambda's body shares its
+# line with the lambda and reports no LINE event of its own. Each code object
+# is reported once per job (DISABLE, re-armed by restart_events at the next
+# job); inside optimize() nothing is reported and events stay armed.
 MON = sys.monitoring
 TOOL = 3
 MON.use_tool_id(TOOL, "br-memo")
+_code_lines = {}
 
 
-def _line(code, line):
+def _start(code, offset):
     if job["in_opt"]:
         return None
     f = code.co_filename
     if f.startswith(SRC_PREFIX):
-        job["lines"].add((os.path.relpath(f, src), line))
+        lines = _code_lines.get(code)
+        if lines is None:
+            rel = os.path.relpath(f, src)
+            lines = _code_lines[code] = {(rel, ln) for _, _, ln in code.co_lines() if ln is not None}
+            lines.add((rel, code.co_firstlineno))
+        job["lines"] |= lines
     return MON.DISABLE
 
 
-MON.register_callback(TOOL, MON.events.LINE, _line)
+MON.register_callback(TOOL, MON.events.PY_START, _start)
+MON.register_callback(TOOL, MON.events.PY_RESUME, _start)
+EVENTS = MON.events.PY_START | MON.events.PY_RESUME
 
 # files of the checkout a job opens (its input beyond the pickled arguments)
 import builtins  # noqa: E402
@@ -137,7 +148,7 @@ class InlineExecutor:
         if mode == "record":
             job["lines"] = set()
             MON.restart_events()
-            MON.set_events(TOOL, MON.events.LINE)
+            MON.set_events(TOOL, EVENTS)
         try:
             try:
                 a, k = pickle.loads(pickle.dumps((args, kwargs)))

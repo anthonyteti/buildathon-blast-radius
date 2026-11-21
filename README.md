@@ -142,8 +142,10 @@ runs the executor tests unpatched and records (`maps/memo.pkl`, `app/memo.py`):
   the digest of the pool initializer's pickled arguments;
 - per job, a digest of the tree `optimize()` returned inside
   `sqlglot.executor.execute` (every node's class and slots, back-pointers,
-  shared nodes) and the lines of the checkout the job ran outside that call
-  (`sys.monitoring`), plus the files jobs open (none).
+  shared nodes) and the lines of the checkout the job may run outside that
+  call: every line of every function, lambda or module body started or
+  resumed outside it (`sys.monitoring` PY_START/PY_RESUME), plus the files
+  jobs open (none).
 
 For a still-selected expensive test with a recording, the verification child
 runs the whole test with the patch applied, except that
