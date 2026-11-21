@@ -127,16 +127,38 @@ expensive candidates are left out; everything not run stays selected. This is
 weak-mutation evidence about the change itself, not a table of edits. It was
 enabled after showing no miss on 300+ self-generated, fully labelled changes.
 
-### Expensive pool-based tests: run only the jobs that reach the change
+### Expensive executor tests: run them here, replaying what cannot change
 
-`test_execute_tpcds` (21.5 s) runs 99 queries as process-pool jobs and skips
-comparing a job whose result is `None`. When every changed line it reached ran
-only inside some of its jobs, the verification child runs the test with just
-those jobs (the others return `None` at once). If it passes, the test cannot
-fail on this change and is left out. The run counts as a pass only if the test
-submitted exactly the number of jobs recorded in the map, and it is capped at
-its estimated CPU; anything else keeps the test selected. It is used only when
-the expected saving beats the measured cost (`BR_JOB_SUBSETS=0` turns it off).
+`test_execute_tpcds` (21.5 s) compares sqlglot's Python executor with duckdb
+on 99 queries: each query runs as a process-pool job, and duckdb runs the
+query transpiled by sqlglot. Most of its time is duckdb and jobs whose inputs
+and code a patch does not touch. When the image is built, `tools/build_memo.py`
+runs the executor tests unpatched and records (`maps/memo.pkl`, `app/memo.py`):
+
+- the DataFrame of every duckdb read query, keyed by the text of every
+  statement run on that connection before it (the views over the data files)
+  and the query text;
+- each pool job's pickled arguments (digest), pickled result and CPU, and
+  the digest of the pool initializer's pickled arguments.
+
+For a still-selected expensive test with a recording, the verification child
+runs the whole test with the patch applied, except that
+
+- a duckdb query whose connection history and text match the recording
+  returns the recorded frame (duckdb sees only SQL text and the data files);
+- a job that ran none of the changed lines in the per-job coverage
+  (`maps/jobs.json.gz`, not used for changes that run at import time or in
+  test files), whose arguments and pool initializer arguments pickle to the
+  recorded bytes, returns its recorded result: same code, same input.
+
+Everything else, including every sqlglot call in the test process (parsing,
+transpiling, unpickling and comparing results), runs for real on the patched
+code, and jobs run when the test asks for their result, so a failing test
+stops early. A pass means the test passes on this change; the test is then
+left out. Without a recording, pool-based tests whose changed lines ran only
+inside jobs run just those jobs (the others return `None`, which these tests
+skip). It is used only when the expected saving beats the estimated CPU
+(`BR_JOB_SUBSETS=0` / `BR_MEMO=0` turn it off).
 
 Selected tests are packed (`app/pack.py`) to minimise
 `max worker load + 2 s x workers` over 1..8 workers: exact search for small
@@ -155,6 +177,8 @@ table from patches or kinds of edit to failing tests.
 - `maps/coverage.json.gz`: the maps (test sets stored as hex bitmasks over the map's test list).
 - `maps/cpu.json`: in-process CPU per test and per `setUpClass`.
 - `maps/jobs.json.gz`: per-job coverage of pool-based tests (loaded on demand).
+- `maps/memo.pkl` (made when the image is built, `tools/build_memo.py`):
+  recorded duckdb results and pool jobs of the executor tests.
 - `maps/keys.json.gz`: which tests looked up which keys of class-level dict
   tables (loaded on demand; `tools/build_keys.sh` runs `run_keytrace.sh` with
   `keytrace.py` inside the submission image, then `build_keys.py`).

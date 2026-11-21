@@ -22,6 +22,8 @@ import time
 
 SRC = os.environ.get("SQLGLOT_SRC", "/opt/sqlglot")
 HEAVY_LIBS = ("numpy", "pandas", "duckdb")
+# replay recorded duckdb results and pool jobs where exact (app/memo.py)
+MEMO = os.environ.get("BR_MEMO", "1") == "1"
 _HEAVY_RE = re.compile(r"^\s*(import|from)\s+(pandas|duckdb|numpy)\b", re.M)
 
 
@@ -78,8 +80,10 @@ class Verifier:
         With probe=True, patched modules carry infection probes (app/probe.py).
         jobs={test: (job indices, job count)}: in that test, process-pool jobs
         outside the set return None without running (numbering as in
-        tools/covplugin.py); the test only counts as passed if it submitted
-        exactly the recorded number of jobs.
+        tools/covplugin.py); with a third item "memo", they return their
+        recorded result when that is exact (app/memo.py) and run otherwise.
+        The test only counts as passed if it submitted exactly the recorded
+        number of jobs.
         Returns (passed numbers, first non-passing number or None,
         (probe executions, infected executions) or None)."""
         # keep each class's tests together: unittest re-runs setUpClass (1.5 s
@@ -109,7 +113,7 @@ class Verifier:
             try:
                 os.dup2(2, 1)  # nothing a test prints may reach our stdout
                 _child(patched, [(n, self.tests[n]["id"], per_test[n]) for n in nums], w, probe,
-                       {self.tests[n]["id"]: (set(js), cnt) for n, (js, cnt) in (jobs or {}).items()})
+                       {self.tests[n]["id"]: (set(j[0]), j[1], *j[2:]) for n, j in (jobs or {}).items()})
             except BaseException:  # noqa: BLE001
                 code = 1
             finally:
@@ -273,24 +277,67 @@ def _install(patched, probe=False):
     import concurrent.futures.process as cfp
     import pickle
 
+    from . import memo as memolib
+
+    class _LazyFuture(cf.Future):
+        def __init__(self, run):
+            super().__init__()
+            self._br_run = run
+
+        def _br_force(self):
+            run, self._br_run = self._br_run, None
+            if run is not None:
+                run(self)
+
+        def result(self, timeout=None):
+            self._br_force()
+            return super().result(timeout)
+
+        def exception(self, timeout=None):
+            self._br_force()
+            return super().exception(timeout)
+
     class InlineExecutor:
         def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
+            blob = pickle.dumps(initargs)
+            self._init_key = memolib.blob_key(blob)
             if initializer is not None:
-                initializer(*pickle.loads(pickle.dumps(initargs)))
+                initializer(*pickle.loads(blob))
 
         def submit(self, fn, *args, **kwargs):
             fut = cf.Future()
             i = _job_state["n"]
             _job_state["n"] += 1
-            only = _job_state["only"].get(_job_state["test"])
+            tid = _job_state["test"]
+            only = _job_state["only"].get(tid)
             if only is not None and i not in only[0]:
-                fut.set_result(None)  # job does not reach the change
-                return fut
-            try:
-                a, k = pickle.loads(pickle.dumps((args, kwargs)))
-                fut.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
-            except BaseException as e:  # noqa: BLE001
-                fut.set_exception(e)
+                if len(only) < 3 or only[2] != "memo":
+                    fut.set_result(None)  # job does not reach the change
+                    return fut
+                # memo mode: a job that does not reach the change, with the
+                # recorded pool initializer and arguments, returns its
+                # recorded result (app/memo.py); otherwise it runs
+                m = memolib.load() or {}
+                rec = m.get("jobs", {}).get(tid) or []
+                if (i < len(rec) and rec[i] is not None and m.get("inits", {}).get(tid) == self._init_key
+                        and rec[i][0] == memolib.args_key(args, kwargs)):
+                    _job_state["replayed"] += 1
+                    fut.set_result(pickle.loads(rec[i][1]))
+                    return fut
+            blob = pickle.dumps((args, kwargs))
+
+            def run(f):
+                try:
+                    a, k = pickle.loads(blob)
+                    f.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+                except BaseException as e:  # noqa: BLE001
+                    f.set_exception(e)
+
+            if only is not None and len(only) > 2 and only[2] == "memo":
+                # the job runs when its result is first asked for, so a test
+                # that checks results in order stops at the first failing job
+                return _LazyFuture(run)
+            run(fut)
             return fut
 
         def map(self, fn, *its, **kw):
@@ -337,13 +384,22 @@ def _state_child(patched, wfd, only=None):
     out.flush()
 
 
-_job_state = {"test": None, "n": 0, "only": {}}
+_job_state = {"test": None, "n": 0, "only": {}, "replayed": 0}
 
 
 def _child(patched, plan, wfd, probe=False, jobs=None):
     out = os.fdopen(wfd, "w", buffering=1)
     recorder = _install(patched, probe)
     _job_state["only"] = jobs or {}
+    m = None
+    if MEMO:
+        from . import memo as memolib
+
+        m = memolib.load()
+    if m and "duckdb" in sys.modules:
+        # duckdb read queries whose connection history and text match the
+        # unpatched run return the recorded frame (app/memo.py)
+        memolib.install_duckdb(m["duckdb"], "replay")
 
     import unittest
 
@@ -408,6 +464,7 @@ def _child(patched, plan, wfd, probe=False, jobs=None):
         def addSubTest(self, test, subtest, err):
             if err is not None:
                 self._fail()
+                raise _Timeout()  # the test is kept anyway: stop running it
 
         def stopTest(self, test):
             signal.setitimer(signal.ITIMER_PROF, 0)

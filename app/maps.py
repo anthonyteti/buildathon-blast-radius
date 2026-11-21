@@ -94,10 +94,11 @@ class Maps:
         idx = self.uses.get(path)
         return set(self.set(idx)) if idx is not None else set()
 
-    def jobs_reaching(self, number, looked_up):
+    def jobs_reaching(self, number, looked_up, main_ok=False):
         """For a test that submits work to a process pool: (job count, set of
         jobs that ran any of the looked-up lines), or None when some of those
-        lines also ran outside its jobs (then the whole test is needed)."""
+        lines also ran outside its jobs (then the whole test is needed;
+        main_ok=True ignores that) or the test has no per-job map."""
         if self._jobs is None:
             try:
                 with gzip.open(os.path.join(MAPS, "jobs.json.gz"), "rb") as fh:
@@ -110,7 +111,7 @@ class Maps:
         mask = 0
         for f, lines in looked_up.items():
             main = set(entry["main"].get(f, ()))
-            if main & set(lines):
+            if main & set(lines) and not main_ok:
                 return None
             fl = entry["lines"].get(f, {})
             for ln in lines:

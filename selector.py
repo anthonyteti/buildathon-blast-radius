@@ -15,7 +15,8 @@ from app.pack import pack  # noqa: E402
 from app import policy  # noqa: E402
 from app import state  # noqa: E402
 from app.probe import instrument  # noqa: E402
-from app.verify import SRC, Verifier  # noqa: E402
+from app.verify import MEMO, SRC, Verifier  # noqa: E402
+from app import memo  # noqa: E402
 
 DATA = os.environ.get("BR_DATA", "/data")
 # Past this many seconds, remaining commits get the run-everything answer.
@@ -64,6 +65,8 @@ def patched_texts(parts):
     for fd, _ in parts:
         if fd.status != "modify" or fd.binary or not fd.path.startswith(("sqlglot/", "tests/")):
             return None
+        if fd.path.endswith((".csv", ".gz", ".parquet")):
+            return None  # data files duckdb reads from disk, past the open() hook
         with open(os.path.join(SRC, fd.path), encoding="utf-8") as fh:
             old = fh.read().split("\n")
         new, _ = patchlib.apply(old, fd.hunks)
@@ -249,34 +252,77 @@ def run_plans(commits, verifier, ms, cpu, verify_until):
         )
 
 
+def _memo_plan(rec, mc, maps, verifier, c, h, tid, cls, exact_jobs):
+    """-> (jobs that must run, recorded job count, estimated CPU ms) for
+    running test h with the recording (app/memo.py)."""
+    recorded_jobs = (rec.get("jobs") or {}).get(tid) or []
+    count = len(recorded_jobs)
+    r = maps.jobs_reaching(h, c.info["looked_up"], main_ok=True) if exact_jobs else None
+    if count and (r is None or r[0] != count):
+        jobs = set(range(count))  # every job runs
+    else:
+        jobs = r[1] if r else set()
+    if any(r is None for j, r in enumerate(recorded_jobs) if j in jobs):
+        job_ms = mc["replay"] - mc["replay_all"]
+    else:
+        job_ms = sum(r[2] for j, r in enumerate(recorded_jobs) if r is not None and j in jobs)
+    run_ms = policy.FIXED_MS + policy.ALPHA * (maps.class_setup_ms(cls) + mc["replay_all"] + job_ms)
+    return jobs, count, run_ms
+
+
 def plan_jobs(commits, analyzer, verifier, ms):
-    """Expensive pool-based tests (test_execute_tpcds, ...) still selected:
-    run just the jobs that reach the changed lines; the others return None,
-    which these tests skip. A pass means the test cannot fail on this change.
-    -> [(commit, test, jobs)] worth running."""
+    """Expensive tests still selected that the recorded unpatched run
+    (app/memo.py, maps/memo.pkl) can make cheap to run here:
+    - pool-based tests (test_execute_tpcds, ...): jobs that reach a changed
+      line run, the others return their recorded result when their pool
+      initializer and arguments are byte-identical to the recorded run, and
+      run otherwise;
+    - duckdb read queries with the recorded connection history and text return
+      the recorded frame.
+    Everything sqlglot computes outside those jobs runs for real, so a pass
+    means the test passes on this change.
+    Without a recording: pool-based tests whose changed lines ran only inside
+    jobs run just those jobs (the others return None, which they skip).
+    -> [(commit, test, jobs, job count, mode, estimated ms)] worth running."""
     maps = analyzer.maps
+    rec = memo.load() if MEMO else None
+    rec_cpu = (rec or {}).get("cpu_ms", {})
     out = []
     for c in commits:
-        if c.sel is ALL or c.patched is None or not c.info or c.info["whole_file"] or c.info["import_time"]:
+        if c.sel is ALL or c.patched is None or not c.info:
             continue
+        exact_jobs = not (c.info["whole_file"] or c.info["import_time"])
         for h in sorted(c.sel):
             if ms[h] < policy.HEAVY_MS or h in maps.unverifiable:
                 continue
-            r = maps.jobs_reaching(h, c.info["looked_up"])
-            if r is None or not r[1]:
-                continue
-            count, jobs = r
+            tid = verifier.tests[h]["id"]
             cls = verifier.class_of(h)
-            # measured: a small fixed part (class setup, parsing every job's input)
-            # plus each job at ~1.6x the test's average per-job CPU
-            run_ms = policy.FIXED_MS + policy.ALPHA * (
-                maps.class_setup_ms(cls) + maps.cpu_ms[h] * (0.01 + 1.6 * len(jobs) / count)
-            )
+            mc = rec_cpu.get(tid)
+            if mc:
+                try:
+                    plan = _memo_plan(rec, mc, maps, verifier, c, h, tid, cls, exact_jobs)
+                except Exception:  # noqa: BLE001  (an unreadable recording: skip it)
+                    continue
+                jobs, count, run_ms = plan
+                mode = "memo"
+            else:
+                if not exact_jobs:
+                    continue
+                r = maps.jobs_reaching(h, c.info["looked_up"])
+                if r is None or not r[1]:
+                    continue
+                count, jobs = r
+                # measured: a small fixed part (class setup, parsing every job's input)
+                # plus each job at ~1.6x the test's average per-job CPU
+                run_ms = policy.FIXED_MS + policy.ALPHA * (
+                    maps.class_setup_ms(cls) + maps.cpu_ms[h] * (0.01 + 1.6 * len(jobs) / count)
+                )
+                mode = "only"
             saved = pack(c.sel, ms)[0] - pack(c.sel - {h}, ms)[0]
             # a failing job stops the run early: assume half the cost then
             gain = policy.P_HEAVY_PASS * saved - run_ms * (policy.P_HEAVY_PASS + (1 - policy.P_HEAVY_PASS) / 2)
             if gain > policy.MIN_GAIN_MS:
-                out.append((gain, c, h, jobs, count, run_ms))
+                out.append((gain, c, h, jobs, count, mode, run_ms))
     # these tests need pandas/numpy/duckdb: worth importing only for enough gain
     if out and not verifier.heavy_loaded and sum(g for g, *_ in out) < policy.HEAVY_IMPORT_MS:
         return []
@@ -284,7 +330,7 @@ def plan_jobs(commits, analyzer, verifier, ms):
 
 
 def run_jobs(plans, verifier, ms, cpu, verify_until):
-    for c, h, jobs, count, run_ms in plans:
+    for c, h, jobs, count, mode, run_ms in plans:
         if h not in c.sel:
             continue
         left = verify_until - time.monotonic()
@@ -293,16 +339,17 @@ def run_jobs(plans, verifier, ms, cpu, verify_until):
             continue
         # CPU cap from the planned job count: a change can make a few jobs very
         # slow, and running into the cap just keeps the test selected
-        limit = max(2.0, run_ms / 1000)
+        limit = max(2.0, 1.5 * run_ms / 1000)
         try:
             cpu0 = verifier.cpu_children
-            passed, failed, _ = verifier.run(c.patched, [h], {h: limit}, min(left, 5 + limit), jobs={h: (jobs, count)})
+            passed, failed, _ = verifier.run(c.patched, [h], {h: limit}, min(left, 5 + limit),
+                                             jobs={h: (jobs, count, mode)} if count or mode == "only" else None)
         except Exception as e:  # noqa: BLE001
             c.why += f" | jobs error {e!r}"
             continue
         if h in passed:
             c.sel = c.sel - {h}
-        c.why += (f" | ran {len(jobs)} jobs of {h}: {'passed' if h in passed else 'kept'},"
+        c.why += (f" | ran {len(jobs)}/{count} jobs of {h} ({mode}): {'passed' if h in passed else 'kept'},"
                   f" cpu {verifier.cpu_children - cpu0:.2f}s")
 
 

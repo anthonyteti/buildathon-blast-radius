@@ -18,6 +18,10 @@ COPY app /app/app
 COPY selector.py /app/selector.py
 # Fingerprint of sqlglot's import-time state, unpatched (see app/state.py).
 RUN cd /app && PYTHONPATH=/opt/sqlglot:/app SKIP_INTEGRATION=0 python -m app.state /app/maps/baseline_state.json
+# Unpatched results of the executor tests' duckdb queries and pool jobs (see
+# app/memo.py). Optional: if recording fails, the selector does without it.
+COPY tools/build_memo.py /app/tools/build_memo.py
+RUN cd /app && (python tools/build_memo.py /opt/sqlglot /app/maps/memo.pkl || rm -f /app/maps/memo.pkl)
 RUN python -m compileall -q /app && chmod -R a+rX /app
 ENV PYTHONDONTWRITEBYTECODE=1 SQLGLOT_SRC=/opt/sqlglot SKIP_INTEGRATION=0
 CMD ["python", "/app/selector.py"]
