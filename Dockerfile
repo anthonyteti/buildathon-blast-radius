@@ -21,7 +21,10 @@ RUN cd /app && PYTHONPATH=/opt/sqlglot:/app SKIP_INTEGRATION=0 python -m app.sta
 # Unpatched results of the executor tests' duckdb queries and pool jobs (see
 # app/memo.py). Optional: if recording fails, the selector does without it.
 COPY tools/build_memo.py /app/tools/build_memo.py
-RUN cd /app && (python tools/build_memo.py /opt/sqlglot /app/maps/memo.pkl || rm -f /app/maps/memo.pkl)
+# Capped at 5 minutes (about 25 s normally), no stdin; any failure or timeout
+# just leaves the recording out.
+RUN cd /app && (timeout -k 10 300 python tools/build_memo.py /opt/sqlglot /app/maps/memo.pkl < /dev/null \
+    || rm -f /app/maps/memo.pkl); ls -la /app/maps
 RUN python -m compileall -q /app && chmod -R a+rX /app
 ENV PYTHONDONTWRITEBYTECODE=1 SQLGLOT_SRC=/opt/sqlglot SKIP_INTEGRATION=0
 CMD ["python", "/app/selector.py"]

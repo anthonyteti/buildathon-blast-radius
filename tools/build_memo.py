@@ -196,8 +196,17 @@ cfp.ProcessPoolExecutor = InlineExecutor
 import duckdb  # noqa: E402
 
 _real_connect = duckdb.connect
-duckdb.connect = lambda *a, **k: memo.Connection(
-    _real_connect(*a, **k), store, "record" if state["mode"] == "record" else "replay")
+# never fetch duckdb extensions while the image builds: a query that needs one
+# fails, the recording is dropped, and the selector does without it
+_OFFLINE = {"autoinstall_known_extensions": False, "autoload_known_extensions": False}
+
+
+def _connect(*a, **k):
+    k["config"] = {**_OFFLINE, **(k.get("config") or {})}
+    return memo.Connection(_real_connect(*a, **k), store, "record" if state["mode"] == "record" else "replay")
+
+
+duckdb.connect = _connect
 
 
 def cpu():
